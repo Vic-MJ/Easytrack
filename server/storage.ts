@@ -3243,91 +3243,86 @@ export class DatabaseStorage implements IStorage {
         errors: 0
       };
 
-      // Restaurar en orden dependiente de las relaciones
+      // Helper function to split array into chunks/batches
+      const chunk = (arr: any[], size: number): any[][] =>
+        Array.from({ length: Math.ceil(arr.length / size) }, (v, i) =>
+          arr.slice(i * size, i * size + size)
+        );
 
       // 1. Usuarios primero (sin dependencias)
       if (backupData.tables.users && Array.isArray(backupData.tables.users)) {
         console.log(`Restaurando ${backupData.tables.users.length} usuarios...`);
-        for (const userData of backupData.tables.users) {
-          try {
-            const existingUser = await this.getUserByUsername(userData.username);
-            if (!existingUser) {
-              await db.insert(users).values({
-                ...userData,
-                createdAt: userData.createdAt ? new Date(userData.createdAt) : new Date()
-              });
-              restored.users++;
-              console.log(`Usuario ${userData.username} restaurado exitosamente`);
-            } else {
-              console.log(`Usuario ${userData.username} ya existe, omitiendo`);
+        try {
+          const existingUsers = await db.select({ username: users.username }).from(users);
+          const existingUsernames = new Set(existingUsers.map(u => u.username));
+          
+          const usersToInsert = backupData.tables.users
+            .filter((userData: any) => !existingUsernames.has(userData.username))
+            .map((userData: any) => ({
+              ...userData,
+              createdAt: userData.createdAt ? new Date(userData.createdAt) : new Date()
+            }));
+
+          if (usersToInsert.length > 0) {
+            const userChunks = chunk(usersToInsert, 100);
+            for (const c of userChunks) {
+              await db.insert(users).values(c).onConflictDoNothing();
+              restored.users += c.length;
             }
-          } catch (error: any) {
-            console.error(`Error restoring user ${userData.username}:`, error);
-            restored.errors++;
           }
+          console.log(`Usuarios procesados: ${restored.users} creados`);
+        } catch (error: any) {
+          console.error("Error al restaurar usuarios en lote:", error);
+          restored.errors += backupData.tables.users.length;
         }
-        console.log(`Usuarios procesados: ${restored.users} creados`);
       }
 
       // 2. Reposiciones
       if (backupData.tables.repositions && Array.isArray(backupData.tables.repositions)) {
         console.log(`Restaurando ${backupData.tables.repositions.length} reposiciones...`);
+        try {
+          const existingRepositions = await db.select({ folio: repositions.folio }).from(repositions);
+          const existingFolios = new Set(existingRepositions.map(r => r.folio));
 
-        // Log sample of repositions being restored
-        if (backupData.tables.repositions.length > 0) {
-          console.log('Sample repositions to restore:', backupData.tables.repositions.slice(0, 3).map((r: any) => ({
-            folio: r.folio,
-            status: r.status,
-            type: r.type,
-            solicitanteArea: r.solicitanteArea
-          })));
-        }
+          const repositionsToInsert = backupData.tables.repositions
+            .filter((repositionData: any) => !existingFolios.has(repositionData.folio))
+            .map((repositionData: any) => ({
+              ...repositionData,
+              fechaSolicitud: repositionData.fechaSolicitud ? new Date(repositionData.fechaSolicitud) : new Date(),
+              createdAt: repositionData.createdAt ? new Date(repositionData.createdAt) : new Date(),
+              completedAt: repositionData.completedAt ? new Date(repositionData.completedAt) : null,
+              approvedAt: repositionData.approvedAt ? new Date(repositionData.approvedAt) : null
+            }));
 
-        for (const repositionData of backupData.tables.repositions) {
-          try {
-            const existingReposition = await db.select().from(repositions).where(eq(repositions.folio, repositionData.folio)).limit(1);
-            if (existingReposition.length === 0) {
-              const insertData = {
-                ...repositionData,
-                fechaSolicitud: repositionData.fechaSolicitud ? new Date(repositionData.fechaSolicitud) : new Date(),
-                createdAt: repositionData.createdAt ? new Date(repositionData.createdAt) : new Date(),
-                completedAt: repositionData.completedAt ? new Date(repositionData.completedAt) : null,
-                approvedAt: repositionData.approvedAt ? new Date(repositionData.approvedAt) : null
-              };
-
-              // Log what we're inserting
-              console.log(`Inserting reposition ${repositionData.folio} with status: ${repositionData.status}`);
-
-              await db.insert(repositions).values(insertData);
-              restored.repositions++;
-            } else {
-              console.log(`Reposición ${repositionData.folio} ya existe, omitiendo`);
+          if (repositionsToInsert.length > 0) {
+            const repoChunks = chunk(repositionsToInsert, 200);
+            for (const c of repoChunks) {
+              await db.insert(repositions).values(c);
+              restored.repositions += c.length;
             }
-          } catch (error: any) {
-            console.error(`Error restoring reposition ${repositionData.folio}:`, error);
-            restored.errors++;
           }
+          console.log(`Reposiciones procesadas: ${restored.repositions} creadas`);
+        } catch (error: any) {
+          console.error("Error al restaurar reposiciones en lote:", error);
+          restored.errors += backupData.tables.repositions.length;
         }
-        console.log(`Reposiciones procesadas: ${restored.repositions} creadas`);
-
-        // Verify repositions were inserted
-        const totalAfterRestore = await db.select({ count: sql<number>`COUNT(*)::int` }).from(repositions);
-        console.log(`Total repositions in database after restore: ${totalAfterRestore[0]?.count || 0}`);
       }
 
       // 3. Piezas de reposiciones
       if (backupData.tables.repositionPieces && Array.isArray(backupData.tables.repositionPieces)) {
         console.log(`Restaurando ${backupData.tables.repositionPieces.length} piezas de reposiciones...`);
-        for (const pieceData of backupData.tables.repositionPieces) {
+        const piecesChunks = chunk(backupData.tables.repositionPieces, 200);
+        for (const c of piecesChunks) {
           try {
-            await db.insert(repositionPieces).values({
+            const valuesToInsert = c.map((pieceData: any) => ({
               ...pieceData,
               createdAt: pieceData.createdAt ? new Date(pieceData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.repositionPieces++;
+            }));
+            await db.insert(repositionPieces).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionPieces += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition piece:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition piece chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Piezas de reposiciones procesadas: ${restored.repositionPieces} restauradas`);
@@ -3336,16 +3331,18 @@ export class DatabaseStorage implements IStorage {
       // 4. Productos de reposiciones
       if (backupData.tables.repositionProducts && Array.isArray(backupData.tables.repositionProducts)) {
         console.log(`Restaurando ${backupData.tables.repositionProducts.length} productos de reposiciones...`);
-        for (const productData of backupData.tables.repositionProducts) {
+        const productsChunks = chunk(backupData.tables.repositionProducts, 200);
+        for (const c of productsChunks) {
           try {
-            await db.insert(repositionProducts).values({
+            const valuesToInsert = c.map((productData: any) => ({
               ...productData,
               createdAt: productData.createdAt ? new Date(productData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.repositionProducts++;
+            }));
+            await db.insert(repositionProducts).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionProducts += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition product:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition product chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Productos de reposiciones procesadas: ${restored.repositionProducts} restaurados`);
@@ -3354,17 +3351,19 @@ export class DatabaseStorage implements IStorage {
       // 5. Transferencias de reposiciones
       if (backupData.tables.repositionTransfers && Array.isArray(backupData.tables.repositionTransfers)) {
         console.log(`Restaurando ${backupData.tables.repositionTransfers.length} transferencias de reposiciones...`);
-        for (const transferData of backupData.tables.repositionTransfers) {
+        const transfersChunks = chunk(backupData.tables.repositionTransfers, 200);
+        for (const c of transfersChunks) {
           try {
-            await db.insert(repositionTransfers).values({
+            const valuesToInsert = c.map((transferData: any) => ({
               ...transferData,
               createdAt: transferData.createdAt ? new Date(transferData.createdAt) : new Date(),
               processedAt: transferData.processedAt ? new Date(transferData.processedAt) : null
-            }).onConflictDoNothing();
-            restored.repositionTransfers++;
+            }));
+            await db.insert(repositionTransfers).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionTransfers += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition transfer:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition transfer chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Transferencias de reposiciones procesadas: ${restored.repositionTransfers} restauradas`);
@@ -3373,66 +3372,77 @@ export class DatabaseStorage implements IStorage {
       // 6. Historial de reposiciones
       if (backupData.tables.repositionHistory && Array.isArray(backupData.tables.repositionHistory)) {
         console.log(`Restaurando ${backupData.tables.repositionHistory.length} entradas de historial de reposiciones...`);
-        for (const historyData of backupData.tables.repositionHistory) {
+        const historyChunks = chunk(backupData.tables.repositionHistory, 200);
+        for (const c of historyChunks) {
           try {
-            await db.insert(repositionHistory).values({
+            const valuesToInsert = c.map((historyData: any) => ({
               ...historyData,
               createdAt: historyData.createdAt ? new Date(historyData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.repositionHistory++;
+            }));
+            await db.insert(repositionHistory).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionHistory += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition history:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition history chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Historial de reposiciones procesado: ${restored.repositionHistory} entradas restauradas`);
       }
 
       // 7. Notificaciones
-      if (backupData.tables.notifications) {
-        for (const notificationData of backupData.tables.notifications) {
+      if (backupData.tables.notifications && Array.isArray(backupData.tables.notifications)) {
+        console.log(`Restaurando ${backupData.tables.notifications.length} notificaciones...`);
+        const notificationsChunks = chunk(backupData.tables.notifications, 200);
+        for (const c of notificationsChunks) {
           try {
-            await db.insert(notifications).values({
+            const valuesToInsert = c.map((notificationData: any) => ({
               ...notificationData,
               createdAt: notificationData.createdAt ? new Date(notificationData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.notifications++;
+            }));
+            await db.insert(notifications).values(valuesToInsert).onConflictDoNothing();
+            restored.notifications += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring notification:`, error);
-            restored.errors++;
+            console.error(`Error restoring notification chunk:`, error);
+            restored.errors += c.length;
           }
         }
       }
 
       // 8. Documentos
-      if (backupData.tables.documents) {
-        for (const documentData of backupData.tables.documents) {
+      if (backupData.tables.documents && Array.isArray(backupData.tables.documents)) {
+        console.log(`Restaurando ${backupData.tables.documents.length} documentos...`);
+        const documentsChunks = chunk(backupData.tables.documents, 200);
+        for (const c of documentsChunks) {
           try {
-            await db.insert(documents).values({
+            const valuesToInsert = c.map((documentData: any) => ({
               ...documentData,
               createdAt: documentData.createdAt ? new Date(documentData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.documents++;
+            }));
+            await db.insert(documents).values(valuesToInsert).onConflictDoNothing();
+            restored.documents += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring document:`, error);
-            restored.errors++;
+            console.error(`Error restoring document chunk:`, error);
+            restored.errors += c.length;
           }
         }
       }
 
       // 9. Eventos de agenda
-      if (backupData.tables.agendaEvents) {
-        for (const eventData of backupData.tables.agendaEvents) {
+      if (backupData.tables.agendaEvents && Array.isArray(backupData.tables.agendaEvents)) {
+        console.log(`Restaurando ${backupData.tables.agendaEvents.length} eventos de agenda...`);
+        const eventsChunks = chunk(backupData.tables.agendaEvents, 200);
+        for (const c of eventsChunks) {
           try {
-            await db.insert(agendaEvents).values({
+            const valuesToInsert = c.map((eventData: any) => ({
               ...eventData,
               createdAt: eventData.createdAt ? new Date(eventData.createdAt) : new Date(),
               updatedAt: eventData.updatedAt ? new Date(eventData.updatedAt) : new Date()
-            }).onConflictDoNothing();
-            restored.agendaEvents++;
+            }));
+            await db.insert(agendaEvents).values(valuesToInsert).onConflictDoNothing();
+            restored.agendaEvents += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring agenda event:`, error);
-            restored.errors++;
+            console.error(`Error restoring agenda event chunk:`, error);
+            restored.errors += c.length;
           }
         }
       }
@@ -3440,18 +3450,20 @@ export class DatabaseStorage implements IStorage {
       // 10. Timers de reposiciones
       if (backupData.tables.repositionTimers && Array.isArray(backupData.tables.repositionTimers)) {
         console.log(`Restaurando ${backupData.tables.repositionTimers.length} timers de reposiciones...`);
-        for (const timerData of backupData.tables.repositionTimers) {
+        const timersChunks = chunk(backupData.tables.repositionTimers, 200);
+        for (const c of timersChunks) {
           try {
-            await db.insert(repositionTimers).values({
+            const valuesToInsert = c.map((timerData: any) => ({
               ...timerData,
               createdAt: timerData.createdAt ? new Date(timerData.createdAt) : new Date(),
               startTime: timerData.startTime ? new Date(timerData.startTime) : null,
               endTime: timerData.endTime ? new Date(timerData.endTime) : null
-            }).onConflictDoNothing();
-            restored.repositionTimers++;
+            }));
+            await db.insert(repositionTimers).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionTimers += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition timer:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition timer chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Timers de reposiciones procesados: ${restored.repositionTimers} restaurados`);
@@ -3460,37 +3472,41 @@ export class DatabaseStorage implements IStorage {
       // 11. Materiales de reposiciones
       if (backupData.tables.repositionMaterials && Array.isArray(backupData.tables.repositionMaterials)) {
         console.log(`Restaurando ${backupData.tables.repositionMaterials.length} materiales de reposiciones...`);
-        for (const materialData of backupData.tables.repositionMaterials) {
+        const materialsChunks = chunk(backupData.tables.repositionMaterials, 200);
+        for (const c of materialsChunks) {
           try {
-            await db.insert(repositionMaterials).values({
+            const valuesToInsert = c.map((materialData: any) => ({
               ...materialData,
               createdAt: materialData.createdAt ? new Date(materialData.createdAt) : new Date(),
               updatedAt: materialData.updatedAt ? new Date(materialData.updatedAt) : new Date(),
               pausedAt: materialData.pausedAt ? new Date(materialData.pausedAt) : null,
               resumedAt: materialData.resumedAt ? new Date(materialData.resumedAt) : null
-            }).onConflictDoNothing();
-            restored.repositionMaterials++;
+            }));
+            await db.insert(repositionMaterials).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionMaterials += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition material:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition material chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Materiales de reposiciones procesados: ${restored.repositionMaterials} restaurados`);
       }
 
-      // 11.5 Contraste de telas de reposiciones (Nuevo)
+      // 11.5 Contraste de telas de reposiciones
       if (backupData.tables.repositionContrastFabrics && Array.isArray(backupData.tables.repositionContrastFabrics)) {
         console.log(`Restaurando ${backupData.tables.repositionContrastFabrics.length} contrastes de telas...`);
-        for (const contrastData of backupData.tables.repositionContrastFabrics) {
+        const contrastChunks = chunk(backupData.tables.repositionContrastFabrics, 200);
+        for (const c of contrastChunks) {
           try {
-            await db.insert(repositionContrastFabrics).values({
+            const valuesToInsert = c.map((contrastData: any) => ({
               ...contrastData,
               createdAt: contrastData.createdAt ? new Date(contrastData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.repositionContrastFabrics++;
+            }));
+            await db.insert(repositionContrastFabrics).values(valuesToInsert).onConflictDoNothing();
+            restored.repositionContrastFabrics += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring reposition contrast fabric:`, error);
-            restored.errors++;
+            console.error(`Error restoring reposition contrast fabric chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Contrastes de telas procesados: ${restored.repositionContrastFabrics} restaurados`);
@@ -3499,16 +3515,18 @@ export class DatabaseStorage implements IStorage {
       // 12. Contraseñas de admin
       if (backupData.tables.adminPasswords && Array.isArray(backupData.tables.adminPasswords)) {
         console.log(`Restaurando ${backupData.tables.adminPasswords.length} contraseñas de admin...`);
-        for (const passwordData of backupData.tables.adminPasswords) {
+        const passwordsChunks = chunk(backupData.tables.adminPasswords, 200);
+        for (const c of passwordsChunks) {
           try {
-            await db.insert(adminPasswords).values({
+            const valuesToInsert = c.map((passwordData: any) => ({
               ...passwordData,
               createdAt: passwordData.createdAt ? new Date(passwordData.createdAt) : new Date()
-            }).onConflictDoNothing();
-            restored.adminPasswords++;
+            }));
+            await db.insert(adminPasswords).values(valuesToInsert).onConflictDoNothing();
+            restored.adminPasswords += valuesToInsert.length;
           } catch (error: any) {
-            console.error(`Error restoring admin password:`, error);
-            restored.errors++;
+            console.error(`Error restoring admin password chunk:`, error);
+            restored.errors += c.length;
           }
         }
         console.log(`Contraseñas de admin procesadas: ${restored.adminPasswords} restauradas`);
