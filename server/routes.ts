@@ -377,6 +377,7 @@ function registerAdminRoutes(app: Express) {
 
   router.post("/restore-users", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
     if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    const filePath = req.file?.path;
     try {
       if (!req.file) {
         return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
@@ -388,12 +389,17 @@ function registerAdminRoutes(app: Express) {
         return res.status(400).json({ message: "Solo se permiten archivos .json para restaurar usuarios" });
       }
 
-      const backupData = JSON.parse(req.file.buffer.toString('utf8'));
+      const fileContent = await fs.promises.readFile(filePath, 'utf8');
+      const backupData = JSON.parse(fileContent);
       const result = await storage.restoreUsers(backupData);
       res.json(result);
     } catch (error: any) {
       console.error('Restore users error:', error);
       res.status(500).json({ message: "Error al restaurar usuarios: " + error.message });
+    } finally {
+      if (filePath) {
+        fs.promises.unlink(filePath).catch(err => console.error("Error al eliminar archivo de respaldo temporal:", err));
+      }
     }
   });
 
@@ -412,6 +418,7 @@ function registerAdminRoutes(app: Express) {
 
   router.post("/restore-complete-system", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
     if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    const filePath = req.file?.path;
     try {
       if (!req.file) {
         return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
@@ -423,8 +430,8 @@ function registerAdminRoutes(app: Express) {
       let backupData;
 
       try {
-        backupContent = req.file.buffer.toString('utf-8');
-        console.log('Contenido leído, primeros 200 caracteres:', backupContent.substring(0, 200));
+        backupContent = await fs.promises.readFile(filePath, 'utf-8');
+        console.log('Contenido leído de disco, primeros 200 caracteres:', backupContent.substring(0, 200));
       } catch (error) {
         return res.status(400).json({ message: "Error al leer el archivo de respaldo" });
       }
@@ -454,6 +461,10 @@ function registerAdminRoutes(app: Express) {
       res.status(statusCode).json({
         message: error.message || "Error al restaurar el sistema completo"
       });
+    } finally {
+      if (filePath) {
+        fs.promises.unlink(filePath).catch(err => console.error("Error al eliminar archivo de respaldo temporal:", err));
+      }
     }
   });
 
