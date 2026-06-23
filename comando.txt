@@ -1,0 +1,17 @@
+npm install exceljs recharts date-fns sweetalert2 && npm install && npm run dev
+
+ALTER TABLE repositions ADD COLUMN IF NOT EXISTS area_causante_dano area;
+
+ALTER TYPE reposition_type RENAME VALUE 'repocision' TO 'reposición';
+
+ALTER TABLE repositions ADD COLUMN IF NOT EXISTS ubicacion reposition_contrast_fabrics;
+
+DO $$
+BEGIN
+    BEGIN
+        ALTER TYPE area ADD VALUE 'maquilas';
+    EXCEPTION
+        WHEN duplicate_object THEN NULL;
+    END;
+END
+$$;

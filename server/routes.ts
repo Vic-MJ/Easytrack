@@ -1,0 +1,2444 @@
+import type { Express } from "express";
+import { Router } from "express";
+import { createServer, type Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import { setupAuth } from "./auth";
+import { storage } from "./storage";
+import { insertRepositionSchema, insertRepositionPieceSchema, insertRepositionTransferSchema, insertAdminPasswordSchema, type Area, type RepositionType, type RepositionStatus } from "@shared/schema";
+import { z } from "zod";
+import bcrypt from "bcrypt";
+import { eq, desc, and, or, ne, isNotNull, isNull, count } from 'drizzle-orm';
+import { db, pool } from './db';
+import { repositionTransfers, repositions, systemSettings } from '@shared/schema';
+import { authenticateToken } from './auth';
+import { backupService } from './services/backup-service';
+import path from 'path';
+import fs from 'fs';
+import express from 'express';
+import { upload, uploadBackup, handleMulterError } from './upload';
+import ExcelJS from 'exceljs';
+
+export function registerRoutes(app: Express): Server {
+  setupAuth(app);
+
+  app.post("/api/public/pg-restore-init", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
+      }
+
+      const connectionString = process.env.DATABASE_URL || "postgresql://postgres:12345@localhost:5432/jasanaordenes";
+      const createDbFirst = req.body.createDb === 'true';
+      const { spawn, exec } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(exec);
+      
+      const filePath = req.file.path;
+      const fileExtension = req.file.originalname.toLowerCase().split('.').pop();
+      
+      if (createDbFirst) {
+        try {
+          // Extraer la URL sin la BD para conectarse a la bd por defecto de postgres
+          const baseUrl = connectionString.substring(0, connectionString.lastIndexOf('/'));
+          const defaultDbUrl = `${baseUrl}/postgres`;
+          const dbName = connectionString.substring(connectionString.lastIndexOf('/') + 1);
+          
+          console.log(`Intentando crear la base de datos ${dbName}...`);
+          // ignoramos si ya existe el error usando psql
+          await execAsync(`psql -d "${defaultDbUrl}" -c "CREATE DATABASE \\"${dbName}\\";"`);
+          console.log("Base de datos creada o ya existía.");
+        } catch (e: any) {
+          console.log("Error al crear BD (quizás ya existe):", e.message);
+        }
+      }
+
+      console.log('Restaurando BD desde archivo inicial:', filePath, 'Extension:', fileExtension);
+      
+      let childProcess;
+      if (fileExtension === 'sql') {
+        childProcess = spawn('psql', ['-d', connectionString, '-f', filePath]);
+      } else {
+        childProcess = spawn('pg_restore', ['-c', '--if-exists', '-1', '-d', connectionString, filePath]);
+      }
+      
+      childProcess.stderr.on('data', (data: any) => {
+        console.log(`Restore Init stderr: ${data}`);
+      });
+      
+      childProcess.on('error', (err: any) => {
+        console.error('Error fatal al ejecutar psql/pg_restore para restore-init:', err);
+        fs.unlink(filePath, (unlinkErr) => {
+          if (unlinkErr) console.error("Error al eliminar archivo temporal de restore init en fallback de error:", unlinkErr);
+        });
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          });
+        }
+      });
+      
+      childProcess.on('close', (code: number) => {
+        // Limpiar el archivo subido
+        fs.unlink(filePath, (err) => {
+          if (err) console.error("Error al eliminar archivo temporal de restore init:", err);
+        });
+
+        if (code === 0) {
+          if (!res.headersSent) {
+            res.json({ message: "Base de datos restaurada exitosamente desde modo rescate" });
+          }
+        } else {
+          console.error(`Restore init process exited with code ${code}`);
+          if (!res.headersSent) {
+            res.status(500).json({ message: `Error durante la restauración. Código de salida: ${code}` });
+          }
+        }
+      });
+    } catch (error: any) {
+      console.error('PG Restore Init error:', error);
+      res.status(500).json({ message: "Error al restaurar la base de datos: " + error.message });
+    }
+  });
+
+  // Serve uploads folder statically for images
+  app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+  // Add upload image endpoint for settings/modals
+  app.post("/api/admin/upload-image", authenticateToken, upload.single('image'), handleMulterError, async (req: any, res: any) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No se subió ninguna imagen" });
+      }
+      // Devuelve la URL local del archivo
+      res.json({ url: `/uploads/${req.file.filename}` });
+    } catch (error) {
+      console.error("Error uploading image:", error);
+      res.status(500).json({ error: "Error al subir la imagen" });
+    }
+  });
+
+  registerNotificationRoutes(app);
+  registerRepositionRoutes(app);
+  registerAdminRoutes(app);
+  registerDashboardRoutes(app);
+  registerReportsRoutes(app);
+  registerAgendaRoutes(app);
+  registerAlmacenRoutes(app);
+  registerSettingsRoutes(app);
+  registerMetricsRoutes(app);
+
+  const httpServer = configureWebSocket(app);
+  return httpServer;
+}
+
+
+
+function registerNotificationRoutes(app: Express) {
+  const router = Router();
+
+  router.get("/", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const notifications = await storage.getUserNotifications(user.id);
+      console.log(`Fetched ${notifications.length} notifications for user ${user.id} (${user.area})`);
+      res.json(notifications);
+    } catch (error) {
+      console.error('Get notifications error:', error);
+      res.status(500).json({ message: "Error al obtener notificaciones" });
+    }
+  });
+
+  router.post("/:id/read", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      await storage.markNotificationRead(parseInt(req.params.id));
+      res.json({ message: "Notificación marcada como leída" });
+    } catch (error) {
+      console.error('Mark notification read error:', error);
+      res.status(500).json({ message: "Error al marcar la notificación" });
+    }
+  });
+
+  router.post("/clear-all", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      await storage.clearAllUserNotifications(user.id);
+      res.json({ message: "Todas las notificaciones han sido limpiadas" });
+    } catch (error) {
+      console.error('Clear all notifications error:', error);
+      res.status(500).json({ message: "Error al limpiar las notificaciones" });
+    }
+  });
+
+  app.use("/api/notifications", router);
+}
+
+function registerAdminRoutes(app: Express) {
+  const router = Router();
+
+  router.use((req, res, next) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    const user = req.user!;
+    // Allow 'admin' and 'envios' for initial access
+    if (user.area !== 'admin' && user.area !== 'envios') {
+      return res.status(403).json({ message: "Se requiere acceso de administrador o envíos" });
+    }
+
+    next();
+  });
+
+  router.get("/users", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const users = await storage.getAllUsers();
+      res.json(users);
+    } catch (error) {
+      console.error('Get users error:', error);
+      res.status(500).json({ message: "Error al obtener usuarios" });
+    }
+  });
+
+  router.delete("/users/:id", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const result = await storage.deleteUserById(req.params.id);
+      if (result) {
+        return res.status(200).json({ message: "Usuario eliminado correctamente" });
+      } else {
+        return res.status(404).json({ message: "Usuario no encontrado" });
+      }
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ message: "Error al eliminar el usuario" });
+    }
+  });
+
+  router.post("/reset-password", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const { userId, newPassword } = req.body;
+      if (!userId || !newPassword) return res.status(400).json({ message: "Faltan campos requeridos" });
+
+      const { hashPassword } = await import('./auth');
+      const hashedPassword = await hashPassword(newPassword);
+      await storage.resetUserPassword(userId, hashedPassword);
+      res.json({ message: "Contraseña restablecida correctamente" });
+    } catch (error) {
+      console.error('Reset password error:', error);
+      res.status(500).json({ message: "Error al restablecer la contraseña" });
+    }
+  });
+
+  router.post("/users", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const { name, username, area, password } = req.body;
+
+      console.log('Create user request:', { name, username, area, hasPassword: !!password });
+
+      if (!name || !username || !area || !password) {
+        console.log('Missing required fields');
+        return res.status(400).json({ message: "Todos los campos son requeridos" });
+      }
+
+      // Verificar si el username ya existe
+      const existingUser = await storage.getUserByUsername(username);
+      if (existingUser) {
+        console.log('Username already exists');
+        return res.status(400).json({ message: "El nombre de usuario ya está en uso" });
+      }
+
+      // Importar la función hashPassword del módulo auth
+      const { hashPassword } = await import('./auth');
+      const hashedPassword = await hashPassword(password);
+
+      const userData = {
+        name: name.trim(),
+        username: username.trim(),
+        area,
+        password: hashedPassword
+      };
+
+      const user = await storage.createUser(userData);
+      console.log('User created successfully:', user.id);
+      res.status(201).json({ message: "Usuario creado correctamente", user });
+    } catch (error: any) {
+      console.error('Create user error:', error);
+      res.status(500).json({ message: "Error al crear el usuario", error: error.message });
+    }
+  });
+
+  router.post("/clear-database", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const { deleteUsers } = req.body;
+      console.log('Clear database request with deleteUsers:', deleteUsers);
+      await storage.clearEntireDatabase(deleteUsers);
+      res.json({ message: "Base de datos limpiada correctamente" });
+    } catch (error) {
+      console.error('Clear database error:', error);
+      res.status(500).json({ message: "Error al limpiar la base de datos" });
+    }
+  });
+
+  router.post("/reset-user-sequence", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      await storage.resetUserSequence();
+      res.json({ message: "Secuencia de usuarios reiniciada correctamente" });
+    } catch (error) {
+      console.error('Reset user sequence error:', error);
+      res.status(500).json({ message: "Error al reiniciar secuencia de usuarios" });
+    }
+  });
+
+
+  router.post("/fix-sequences", async (req, res) => {
+    if (req.user?.area !== 'admin' && req.user?.area !== 'envios') {
+      return res.status(403).json({ message: "Se requiere acceso de administrador o envíos" });
+    }
+    try {
+      console.log('Fixing all database sequences...');
+      await storage.fixAllSequences();
+      res.json({ message: "Secuencias de base de datos reparadas correctamente" });
+    } catch (error) {
+      console.error('Fix sequences error:', error);
+      res.status(500).json({ message: "Error al reparar secuencias" });
+    }
+  });
+
+  router.get("/sequences/:table", async (req, res) => {
+    try {
+      const { table } = req.params;
+
+      // Validate table name to prevent arbitrary SQL execution via storage
+      const allowedTables = ['users', 'orders', 'order_pieces', 'order_history', 'repositions', 'reposition_pieces', 'reposition_products', 'reposition_history', 'notifications', 'documents'];
+      if (!allowedTables.includes(table)) {
+        return res.status(400).json({ message: "Tabla no permitida para gestión de secuencias" });
+      }
+
+      const data = await storage.getSequenceData(table);
+      if (!data) {
+        return res.status(404).json({ message: "No se pudo obtener información de la secuencia" });
+      }
+
+      res.json(data);
+    } catch (error) {
+      console.error('Get sequence error:', error);
+      res.status(500).json({ message: "Error al obtener información de secuencia" });
+    }
+  });
+
+  router.post("/sequences", async (req, res) => {
+    try {
+      const { table, value } = req.body;
+
+      if (!table || value === undefined) {
+        return res.status(400).json({ message: "Tabla y valor son requeridos" });
+      }
+
+      // Validate table name
+      const allowedTables = ['users', 'orders', 'order_pieces', 'order_history', 'repositions', 'reposition_pieces', 'reposition_products', 'reposition_history', 'notifications', 'documents'];
+      if (!allowedTables.includes(table)) {
+        return res.status(400).json({ message: "Tabla no permitida para gestión de secuencias" });
+      }
+
+      const numValue = parseInt(value);
+      if (isNaN(numValue) || numValue < 1) {
+        return res.status(400).json({ message: "El valor debe ser un número entero positivo" });
+      }
+
+      await storage.setSequenceValue(table, numValue);
+      res.json({ message: `Secuencia de ${table} actualizada correctamente a ${numValue}` });
+    } catch (error) {
+      console.error('Set sequence error:', error);
+      res.status(500).json({ message: "Error al actualizar secuencia" });
+    }
+  });
+
+  router.get("/backup-users", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const backup = await storage.backupUsers();
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="backup-usuarios-${new Date().toISOString().split('T')[0]}.json"`);
+      res.json(backup);
+    } catch (error) {
+      console.error('Backup users error:', error);
+      res.status(500).json({ message: "Error al generar respaldo de usuarios" });
+    }
+  });
+
+  router.post("/restore-users", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
+      }
+
+      // Verificar que sea un archivo .json
+      const fileExtension = req.file.originalname.toLowerCase().split('.').pop();
+      if (fileExtension !== 'json') {
+        return res.status(400).json({ message: "Solo se permiten archivos .json para restaurar usuarios" });
+      }
+
+      const backupData = JSON.parse(req.file.buffer.toString('utf8'));
+      const result = await storage.restoreUsers(backupData);
+      res.json(result);
+    } catch (error: any) {
+      console.error('Restore users error:', error);
+      res.status(500).json({ message: "Error al restaurar usuarios: " + error.message });
+    }
+  });
+
+  router.get("/backup-complete-system", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const backup = await storage.backupCompleteSystem();
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="backup-completo-jasana-${new Date().toISOString().split('T')[0]}.json"`);
+      res.json(backup);
+    } catch (error) {
+      console.error('Backup complete system error:', error);
+      res.status(500).json({ message: "Error al generar respaldo completo del sistema" });
+    }
+  });
+
+  router.post("/restore-complete-system", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
+      }
+
+      console.log('Archivo recibido:', req.file.originalname, 'Tamaño:', req.file.size);
+
+      let backupContent;
+      let backupData;
+
+      try {
+        backupContent = req.file.buffer.toString('utf-8');
+        console.log('Contenido leído, primeros 200 caracteres:', backupContent.substring(0, 200));
+      } catch (error) {
+        return res.status(400).json({ message: "Error al leer el archivo de respaldo" });
+      }
+
+      try {
+        backupData = JSON.parse(backupContent);
+        console.log('JSON parseado exitosamente');
+      } catch (error) {
+        return res.status(400).json({ message: "El archivo no contiene JSON válido" });
+      }
+
+      await storage.restoreCompleteSystem(backupData);
+
+      res.json({
+        message: "Sistema restaurado exitosamente",
+        timestamp: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error("Error en restauración completa:", error);
+
+      // Determinar el código de estado basado en el tipo de error
+      let statusCode = 500;
+      if (error.message.includes('Formato de respaldo inválido')) {
+        statusCode = 400;
+      }
+
+      res.status(statusCode).json({
+        message: error.message || "Error al restaurar el sistema completo"
+      });
+    }
+  });
+
+  router.get("/pg-backup", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    
+    try {
+      const format = (req.query.format as string) || 'custom'; // custom, plain, tar
+      let pgFormat = 'c';
+      let extension = 'backup';
+      let mimeType = 'application/octet-stream';
+      
+      if (format === 'plain') {
+        pgFormat = 'p';
+        extension = 'sql';
+        mimeType = 'application/sql';
+      } else if (format === 'tar') {
+        pgFormat = 't';
+        extension = 'tar';
+        mimeType = 'application/x-tar';
+      }
+      
+      const filename = `jasana-db-${format}-${new Date().toISOString().split('T')[0]}.${extension}`;
+      
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      
+      const connectionString = process.env.DATABASE_URL || "postgresql://postgres:12345@localhost:5432/jasanaordenes";
+      const { spawn } = await import('child_process');
+      const pgDump = spawn('pg_dump', ['-F', pgFormat, '-d', connectionString]);
+      
+      pgDump.stdout.pipe(res);
+      
+      pgDump.stderr.on('data', (data: any) => {
+        console.error(`pg_dump stderr: ${data}`);
+      });
+      
+      pgDump.on('error', (err: any) => {
+        console.error('Error fatal al ejecutar pg_dump para backup:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            message: `Error al generar el respaldo: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          });
+        }
+      });
+      
+      pgDump.on('close', (code: number) => {
+        if (code !== 0) {
+          console.error(`pg_dump process exited with code ${code}`);
+          if (!res.headersSent) {
+             res.status(500).json({ message: "Error al generar el respaldo de la base de datos" });
+          }
+        }
+      });
+    } catch (error: any) {
+      console.error('PG Backup error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ message: "Error al generar el respaldo: " + error.message });
+      }
+    }
+  });
+
+  router.post("/pg-restore", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
+      }
+
+      const connectionString = process.env.DATABASE_URL || "postgresql://postgres:12345@localhost:5432/jasanaordenes";
+      const { spawn } = await import('child_process');
+      const filePath = req.file.path;
+      const fileExtension = req.file.originalname.toLowerCase().split('.').pop();
+      
+      console.log('Restaurando BD desde archivo:', filePath, 'Extension:', fileExtension);
+      
+      let childProcess;
+      if (fileExtension === 'sql') {
+        // Para texto plano, usar psql
+        childProcess = spawn('psql', ['-d', connectionString, '-f', filePath]);
+      } else {
+        // Para custom/tar, usar pg_restore
+        // -c = clean (drop objects before recreating), -1 = single transaction
+        childProcess = spawn('pg_restore', ['-c', '--if-exists', '-1', '-d', connectionString, filePath]);
+      }
+      
+      childProcess.stderr.on('data', (data: any) => {
+        console.log(`Restore stderr: ${data}`);
+      });
+      
+      childProcess.on('error', (err: any) => {
+        console.error('Error fatal al ejecutar psql/pg_restore para restore:', err);
+        fs.unlink(filePath, (unlinkErr) => {
+          if (unlinkErr) console.error("Error al eliminar archivo temporal de restore en fallback de error:", unlinkErr);
+        });
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          });
+        }
+      });
+      
+      childProcess.on('close', (code: number) => {
+        // Limpiar el archivo subido
+        fs.unlink(filePath, (err) => {
+          if (err) console.error("Error al eliminar archivo temporal de restore:", err);
+        });
+
+        if (code === 0) {
+          if (!res.headersSent) {
+            res.json({ message: "Base de datos restaurada exitosamente" });
+          }
+        } else {
+          console.error(`Restore process exited with code ${code}`);
+          if (!res.headersSent) {
+            res.status(500).json({ message: `Error durante la restauración. Código de salida: ${code}` });
+          }
+        }
+      });
+    } catch (error: any) {
+      console.error('PG Restore error:', error);
+      res.status(500).json({ message: "Error al restaurar la base de datos: " + error.message });
+    }
+  });
+
+  // Rutas de configuración de respaldos automáticos
+  router.get("/backup-config", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const [setting] = await db.select().from(systemSettings).where(eq(systemSettings.key, 'backup_config'));
+      res.json(setting?.value || { enabled: false, frequency: 'daily', hour: 3, minute: 0, keepLast: 10 });
+    } catch (error) {
+      console.error('Get backup config error:', error);
+      res.status(500).json({ message: "Error al obtener configuración de respaldos" });
+    }
+  });
+
+  router.post("/backup-config", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const config = req.body;
+      const [existing] = await db.select().from(systemSettings).where(eq(systemSettings.key, 'backup_config'));
+      
+      if (existing) {
+        await db.update(systemSettings).set({ value: config }).where(eq(systemSettings.key, 'backup_config'));
+      } else {
+        await db.insert(systemSettings).values({ key: 'backup_config', value: config });
+      }
+      
+      // Notificar al servicio para reprogramar
+      await backupService.reschedule();
+      res.json({ message: "Configuración de respaldos actualizada correctamente" });
+    } catch (error) {
+      console.error('Save backup config error:', error);
+      res.status(500).json({ message: "Error al guardar configuración de respaldos" });
+    }
+  });
+
+  router.get("/backups/auto", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const backups = await backupService.listBackups();
+      res.json(backups);
+    } catch (error) {
+      console.error('List backups error:', error);
+      res.status(500).json({ message: "Error al listar respaldos automáticos" });
+    }
+  });
+
+  router.get("/backups/auto/:filename", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const { filename } = req.params;
+      const filepath = backupService.getBackupPath(filename);
+      if (!filepath) return res.status(404).json({ message: "Archivo no encontrado" });
+      
+      res.download(filepath);
+    } catch (error) {
+      console.error('Download backup error:', error);
+      res.status(500).json({ message: "Error al descargar respaldo" });
+    }
+  });
+
+  router.put("/users/:id", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const userId = parseInt(req.params.id);
+      const { name, username, area, newPassword } = req.body;
+
+      console.log('Update user request:', { userId, name, username, area, hasPassword: !!newPassword });
+
+      if (isNaN(userId)) {
+        return res.status(400).json({ message: "ID de usuario inválido" });
+      }
+
+      // Verificar si el usuario existe
+      const currentUser = await storage.getUser(userId);
+      if (!currentUser) {
+        return res.status(404).json({ message: "Usuario no encontrado" });
+      }
+
+      // Si se proporciona un nuevo username, verificar que no esté en uso
+      if (username && username !== currentUser.username) {
+        const existingUser = await storage.getUserByUsername(username);
+        if (existingUser && existingUser.id !== userId) {
+          return res.status(400).json({ message: "El nombre de usuario ya está en uso" });
+        }
+      }
+
+      const updateData: any = { 
+        name: name || currentUser.name, 
+        username: username || currentUser.username, 
+        area: area || currentUser.area,
+        isActive: req.body.isActive !== undefined ? req.body.isActive : currentUser.isActive
+      };
+
+      // Si se proporciona nueva contraseña, hashearla
+      if (newPassword && newPassword.trim() !== "") {
+        const { hashPassword } = await import('./auth');
+        const hashedPassword = await hashPassword(newPassword);
+        updateData.password = hashedPassword;
+        console.log('Password will be updated');
+      }
+
+      await storage.updateUser(userId, updateData);
+      console.log('User updated successfully');
+      res.json({ message: "Usuario actualizado correctamente" });
+    } catch (error: any) {
+      console.error('Update user error:', error);
+      res.status(500).json({ message: "Error al actualizar el usuario", error: error.message });
+    }
+  });
+
+  router.get("/db-stats", async (req, res) => {
+    if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
+    try {
+      const result = await pool.query("SELECT pg_size_pretty(pg_database_size(current_database())) as size");
+      res.json({ size: result.rows[0].size });
+    } catch (error) {
+      console.error('Get db stats error:', error);
+      res.status(500).json({ message: "Error al obtener estadísticas de la base de datos" });
+    }
+  });
+
+  app.use("/api/admin", router);
+}
+
+function registerDashboardRoutes(app: Express) {
+  app.get("/api/dashboard/stats", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const allRepositions = await storage.getAllRepositions(false);
+      const userAreaRepositions = await storage.getRepositions(user.area, user.area);
+      const pendingTransfers = await storage.getPendingRepositionTransfers(user.area);
+
+      const stats = {
+        activeOrders: allRepositions.filter(r => r.status !== 'completado' && r.status !== 'cancelado').length,
+        myAreaOrders: userAreaRepositions.filter(r => r.status !== 'completado' && r.status !== 'cancelado').length,
+        pendingTransfers: pendingTransfers.length,
+        completedToday: allRepositions.filter(r =>
+          r.status === 'completado' &&
+          r.completedAt &&
+          new Date(r.completedAt).toDateString() === new Date().toDateString()
+        ).length,
+      };
+
+      res.json(stats);
+    } catch (error) {
+      console.error('Get dashboard stats error:', error);
+      res.status(500).json({ message: "Error al obtener estadísticas del tablero" });
+    }
+  });
+
+  // Endpoint para actividad reciente del dashboard
+  app.get("/api/dashboard/recent-activity", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+
+      // Obtener reposiciones recientes (solo las últimas 3)
+      let repositionsQuery = db
+        .select({
+          id: repositions.id,
+          folio: repositions.folio,
+          type: repositions.type,
+          status: repositions.status,
+          currentArea: repositions.currentArea,
+          createdAt: repositions.createdAt,
+          solicitanteNombre: repositions.solicitanteNombre,
+          modeloPrenda: repositions.modeloPrenda,
+          urgencia: repositions.urgencia
+        })
+        .from(repositions)
+        .where(ne(repositions.status, 'eliminado'))
+        .orderBy(desc(repositions.createdAt))
+        .limit(3);
+
+      const recentRepositions = await repositionsQuery;
+
+      res.json({
+        repositions: recentRepositions
+      });
+    } catch (error) {
+      console.error('Get recent activity error:', error);
+      res.status(500).json({ message: "Error al obtener actividad reciente" });
+    }
+  });
+}
+
+function configureWebSocket(app: Express): Server {
+  const httpServer = createServer(app);
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+  // Función para enviar notificaciones a todos los clientes conectados
+  const broadcastToAll = (notification: any) => {
+    console.log('Enviando notificación a todos los usuarios conectados:', notification);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(JSON.stringify({
+            type: 'notification',
+            data: notification
+          }));
+        } catch (error) {
+          console.error('Error al enviar notificación WebSocket:', error);
+        }
+      }
+    });
+  };
+
+  wss.on('connection', (ws) => {
+    console.log('Nueva conexión WebSocket establecida');
+
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message.toString());
+        console.log('Mensaje WebSocket recibido:', data);
+
+        // Retransmitir mensaje a todos los clientes conectados
+        broadcastToAll(data);
+      } catch (error) {
+        console.error('Error al procesar mensaje WebSocket:', error);
+      }
+    });
+
+    ws.on('close', () => {
+      console.log('Conexión WebSocket cerrada');
+    });
+
+    ws.on('error', (error) => {
+      console.error('Error en conexión WebSocket:', error);
+    });
+
+    // Enviar mensaje de bienvenida
+    ws.send(JSON.stringify({
+      type: 'connection',
+      data: { message: 'Conectado exitosamente al sistema de notificaciones' }
+    }));
+  });
+
+  // Exponer función debroadcast
+  (httpServer as any).wss = wss;
+  (httpServer as any).broadcast = broadcastToAll;
+
+  // Store httpServer reference in app for access in routes
+  app.set('httpServer', httpServer);
+
+  return httpServer;
+}
+
+function registerRepositionRoutes(app: Express) {
+  const router = Router();
+
+  router.post("/", authenticateToken, upload.array('documents', 5), handleMulterError, async (req: any, res: any) => {
+    try {
+      const user = (req as any).user;
+
+      // Verificar que el área pueda crear reposiciones
+      const allowedAreas = ['corte', 'bordado', 'ensamble', 'plancha', 'calidad', 'envios', 'admin', 'maquilas', 'patronaje'];
+      if (!allowedAreas.includes(user.area)) {
+        return res.status(403).json({ message: "Su área no tiene permisos para crear reposiciones" });
+      }
+
+      let repositionData;
+
+      // Parse repositionData from form
+      if (req.body.repositionData) {
+        repositionData = JSON.parse(req.body.repositionData);
+      } else {
+        repositionData = req.body;
+      }
+
+      const { pieces, productos, telaContraste, ...mainData } = repositionData;
+
+      // Validar datos según el tipo
+      if (mainData.type === 'reproceso') {
+        if (!mainData.volverHacer || !mainData.materialesImplicados) {
+          return res.status(400).json({ message: "Los campos 'volverHacer' y 'materialesImplicados' son requeridos para reprocesos" });
+        }
+      }
+      const files = req.files as Express.Multer.File[];
+
+      const now = new Date();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const year = String(now.getFullYear()).slice(-2);
+      const counter = await storage.getNextRepositionCounter();
+      const folio = `JN-REQ-${month}-${year}-${String(counter).padStart(3, '0')}`;
+
+      // Create reposition with documents
+      const reposition = await storage.createReposition({
+        ...mainData,
+        folio,
+        currentArea: user.area,
+        solicitanteArea: user.area,
+        productos,
+        telaContraste
+      }, pieces || [], user.id);
+
+      // Save documents if any
+      if (files && files.length > 0) {
+        for (const file of files) {
+          await storage.saveRepositionDocument({
+            repositionId: reposition.id,
+            filename: file.filename,
+            originalName: file.originalname,
+            size: file.size,
+            path: file.path,
+            uploadedBy: user.id
+          });
+        }
+      }
+
+      // Check for Auto-Approval Setting
+      const autoApprove = await storage.getSystemSetting('reposition_auto_approve');
+
+      let finalReposition = reposition;
+
+      if (autoApprove === 'true') {
+        console.log('Auto-approving reposition:', reposition.id);
+        const approved = await storage.approveReposition(
+          reposition.id,
+          'aprobado',
+          user.id, // Using the creator ID as approver if auto-approved, or we might want a system ID? Using creator for now or Admin if possible.
+          'Aprobación automática por sistema'
+        );
+        finalReposition = approved;
+      } else {
+        // If not auto-approved, it remains pending
+        finalReposition = reposition;
+      }
+
+
+      res.status(201).json(finalReposition);
+    } catch (error) {
+      console.error('Create reposition error:', error);
+      const errorMessage = error instanceof Error ? error.message : "Error al crear la solicitud de reposición";
+      res.status(400).json({ message: errorMessage });
+    }
+  });
+
+  router.get("/", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const area = req.query.area as string;
+
+      let repositions;
+
+      // Para diseño y almacén: solo mostrar reposiciones aprobadas
+      if (user.area === 'diseño' || user.area === 'almacen') {
+        console.log(`User is from ${user.area} area, filtering approved repositions`);
+        // Diseño puede ver todas las reposiciones aprobadas
+        repositions = await storage.getRepositions(undefined, 'diseño');
+      }
+      else if ((user.area === 'admin' || user.area === 'envios')) {
+        if (area && area !== 'all') {
+          // Admin/envíos con filtro de área específica
+          repositions = await storage.getRepositionsByArea(area as Area, user.id);
+        } else {
+          // Admin/envíos sin filtro de área (todas las reposiciones)
+          repositions = await storage.getAllRepositions(false);
+        }
+      }
+      else if (area && area !== 'all') {
+        // Otras áreas con filtro específico
+        repositions = await storage.getRepositionsByArea(area as Area, user.id);
+      }
+      else {
+        // Otras áreas sin filtro (su área actual)
+        repositions = await storage.getRepositionsByArea(user.area, user.id);
+      }
+
+      res.json(repositions);
+    } catch (error) {
+      console.error('Get repositions error:', error);
+      res.status(500).json({ message: "Error al cargar las reposiciones" });
+    }
+  });
+
+  router.get("/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const reposition = await storage.getRepositionById(id);
+      if (!reposition) {
+        return res.status(404).json({ message: "Reposición no encontrada" });
+      }
+
+      res.json(reposition);
+    } catch (error) {
+      console.error('Get reposition error:', error);
+      res.status(500).json({ message: "Error al obtener la reposición" });
+    }
+  });
+
+  router.get("/:id/pieces", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const pieces = await storage.getRepositionPieces(repositionId);
+      console.log('Pieces from endpoint:', pieces);
+      res.json(pieces);
+    } catch (error) {
+      console.error('Get reposition pieces error:', error);
+      res.status(500).json({ message: "Error al obtener piezas de la reposición" });
+    }
+  });
+
+  router.post("/:id/transfer", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const { toArea, notes, consumoTela } = req.body;
+
+      // Verificar que la reposición existe y está en estado válido
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition) {
+        return res.status(404).json({ message: "Reposición no encontrada" });
+      }
+
+      if (reposition.status !== 'aprobado') {
+        return res.status(400).json({ message: "Solo se pueden transferir reposiciones aprobadas" });
+      }
+
+      // Verificar si hay una transferencia reciente pendiente
+      const recentTransferCheck = await storage.hasRecentTransfer(repositionId, user.area);
+      if (recentTransferCheck.hasRecent) {
+        console.log(`Transfer blocked for reposition ${repositionId} from area ${user.area}, remaining time: ${recentTransferCheck.remainingTime} minutes`);
+        return res.status(429).json({
+          message: `⏱️ Debes esperar ${recentTransferCheck.remainingTime} minuto(s) antes de poder transferir nuevamente. Hay una transferencia pendiente de procesamiento desde tu área.`,
+          remainingTime: recentTransferCheck.remainingTime,
+          type: 'rate_limit'
+        });
+      }
+
+      // Verificar tiempo según la nueva lógica
+      let shouldRequireTime = false;
+
+      // Si no es el área que creó la reposición, siempre requiere tiempo
+      if (reposition.solicitanteArea !== user.area) {
+        shouldRequireTime = true;
+      } else {
+        // Si es el área que creó la reposición, verificar si ha regresado después de circular
+        const history = await storage.getRepositionHistory(repositionId);
+
+        // Contar cuántas veces ha sido aceptada una transferencia hacia esta área
+        const transfersToCreatorArea = history.filter((entry: any) =>
+          entry.action === 'transfer_accepted' && entry.toArea === reposition.solicitanteArea
+        ).length;
+
+        // Si ha regresado por transferencia, debe registrar tiempo
+        if (transfersToCreatorArea > 0) {
+          shouldRequireTime = true;
+        }
+      }
+
+      // Si se requiere tiempo, verificar que esté registrado
+      if (shouldRequireTime) {
+        const timer = await storage.getRepositionTimer(repositionId, user.area);
+        if (!timer || (!timer.manualStartTime && !timer.startTime)) {
+          return res.status(400).json({
+            message: 'Debe registrar el tiempo de trabajo antes de transferir la reposición.',
+            type: 'timer_required'
+          });
+        }
+      }
+
+      // Verificación adicional: comprobar directamente en la base de datos si hay transferencias pendientes
+      const existingPendingTransfers = await db.select().from(repositionTransfers)
+        .where(and(
+          eq(repositionTransfers.repositionId, repositionId),
+          eq(repositionTransfers.fromArea, user.area),
+          eq(repositionTransfers.status, 'pending')
+        ));
+
+      if (existingPendingTransfers.length > 0) {
+        console.log(`Found existing pending transfer for reposition ${repositionId} from area ${user.area}`);
+        return res.status(429).json({
+          message: `Ya existe una transferencia pendiente desde tu área para esta reposición. Espera a que sea procesada antes de crear una nueva.`,
+          type: 'pending_exists'
+        });
+      }
+
+      // Si viene desde Corte y hay consumo de tela, actualizar la reposición
+      if (user.area === 'corte' && consumoTela !== undefined) {
+        await storage.updateRepositionConsumo(repositionId, consumoTela);
+      }
+
+      const transfer = await storage.createRepositionTransfer({
+        repositionId,
+        fromArea: user.area,
+        toArea,
+        notes
+      }, user.id);
+
+      res.status(201).json(transfer);
+    } catch (error) {
+      console.error('Transfer reposition error:', error);
+      res.status(400).json({ message: "Error al crear transferencia de reposición" });
+    }
+  });
+
+  router.post("/:id/approval", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'operaciones' && user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo Operaciones, Administración o Envíos pueden aprobar o rechazar" });
+      }
+
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const { action, notes } = req.body;
+
+      // Require rejection reason for rejections
+      if (action === 'rechazado') {
+        if (!notes || notes.trim().length === 0) {
+          return res.status(400).json({ message: "El motivo del rechazo es obligatorio" });
+        }
+        if (notes.trim().length < 10) {
+          return res.status(400).json({ message: "El motivo del rechazo debe tener al menos 10 caracteres" });
+        }
+      }
+
+      const result = await storage.approveReposition(repositionId, action, user.id, notes);
+      res.json(result);
+    } catch (error) {
+      console.error('Approve reposition error:', error);
+      res.status(400).json({ message: "Error al procesar la aprobación" });
+    }
+  });
+
+  router.put("/:id", authenticateToken, upload.array('documents', 5), handleMulterError, async (req: any, res: any) => {
+    try {
+      const user = (req as any).user;
+      const repositionId = parseInt(req.params.id);
+
+      console.log('Edit reposition request:', { repositionId, userId: user?.id, hasUser: !!user });
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      if (!user) {
+        return res.status(401).json({ message: "Usuario no autenticado" });
+      }
+
+      // Check if the reposition exists and is rejected
+      const existingReposition = await storage.getRepositionById(repositionId);
+      if (!existingReposition) {
+        return res.status(404).json({ message: "Reposición no encontrada" });
+      }
+
+      console.log('Existing reposition:', {
+        id: existingReposition.id,
+        status: existingReposition.status,
+        createdBy: existingReposition.createdBy
+      });
+
+      // Permitir edición si es rechazado y el usuario es el creador, o si el usuario es de envíos/admin
+      const canEdit = (existingReposition.status === 'rechazado' && existingReposition.createdBy === user.id) ||
+        (user.area === 'envios' || user.area === 'admin');
+
+      if (!canEdit) {
+        if (existingReposition.status !== 'rechazado') {
+          return res.status(400).json({ message: "Solo se pueden editar reposiciones rechazadas o si eres de envíos/admin" });
+        } else {
+          return res.status(403).json({ message: "Solo el creador puede editar reposiciones rechazadas, o usuarios de envíos/admin pueden editar cualquier reposición" });
+        }
+      }
+
+      console.log('Received reposition update request. Body keys:', Object.keys(req.body));
+
+      let repositionData;
+      try {
+        if (req.body.repositionData) {
+          console.log('Parsing repositionData from string...');
+          repositionData = JSON.parse(req.body.repositionData);
+        } else {
+          console.log('Using req.body as repositionData');
+          repositionData = req.body;
+        }
+      } catch (parseError) {
+        console.error('Error parsing repository data:', parseError);
+        return res.status(400).json({ message: "Datos de reposición inválidos" });
+      }
+
+      console.log('Parsed reposition data structure:', {
+        type: repositionData.type,
+        folio: repositionData.noSolicitud,
+        hasProductos: !!repositionData.productos,
+        productosLength: repositionData.productos?.length,
+        hasPieces: !!repositionData.pieces,
+        piecesLength: repositionData.pieces?.length
+      });
+
+      // Validar datos básicos
+      if (!repositionData.type) {
+        console.error('Missing type in repositionData');
+        return res.status(400).json({ message: "El tipo de solicitud es requerido" });
+      }
+
+      const { pieces, productos, telaContraste, ...mainData } = repositionData;
+
+      // Collect all pieces from all products for reposiciones, or use direct pieces for reprocesos
+      let allPieces = [];
+      if (repositionData.type === 'reposición' && productos && productos.length > 0) {
+        allPieces = productos.flatMap((producto: any) => producto.pieces || []);
+      } else if (pieces && pieces.length > 0) {
+        allPieces = pieces;
+      }
+
+      console.log('All pieces to update:', allPieces.length);
+      if (allPieces.length > 0) {
+        console.log('Sample piece:', allPieces[0]);
+      }
+
+      const updatedReposition = await storage.updateReposition(
+        repositionId,
+        {
+          ...mainData,
+          productos,
+          telaContraste,
+        },
+        allPieces,
+        user.id
+      );
+
+      // Save new documents if any
+      const files = req.files as Express.Multer.File[];
+      console.log('Files received:', files?.length || 0);
+      if (files && files.length > 0) {
+        console.log('Saving documents:', files.length);
+        for (const file of files) {
+          await storage.saveRepositionDocument({
+            repositionId: repositionId,
+            filename: file.filename,
+            originalName: file.originalname,
+            size: file.size,
+            path: file.path,
+            uploadedBy: user.id
+          });
+        }
+      }
+
+      console.log('Reposition updated successfully');
+      res.json(updatedReposition);
+    } catch (error) {
+      console.error('Update reposition error:', error);
+      // Log full error details
+      if (error instanceof Error) {
+        console.error('Error name:', error.name);
+        console.error('Error message:', error.message);
+        console.error('Error stack:', error.stack);
+      }
+      const errorMessage = error instanceof Error ? error.message : "Error al actualizar la reposición";
+      res.status(500).json({ message: errorMessage });
+    }
+  });
+
+  router.post("/transfers/:id/process", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const transferId = parseInt(req.params.id);
+      if (isNaN(transferId)) {
+        return res.status(400).json({ message: "ID de transferencia inválido" });
+      }
+      const { action, reason } = req.body;
+
+      // Validar que se proporcione razón para rechazos
+      if (action === 'rejected') {
+        if (!reason || reason.trim().length === 0) {
+          return res.status(400).json({ message: "El motivo del rechazo es obligatorio" });
+        }
+        if (reason.trim().length < 5) {
+          return res.status(400).json({ message: "El motivo debe tener al menos 5 caracteres" });
+        }
+      }
+
+      const result = await storage.processRepositionTransfer(transferId, action, user.id, reason?.trim());
+      res.json(result);
+    } catch (error) {
+      console.error('Process transfer error:', error);
+      res.status(400).json({ message: "Error al procesar la transferencia" });
+    }
+  });
+
+  router.get("/:id/history", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const history = await storage.getRepositionHistory(repositionId);
+      res.json(history);
+    } catch (error) {
+      console.error('Get reposition history error:', error);
+      res.status(500).json({ message: "Error al obtener historial de la reposición" });
+    }
+  });
+
+  router.get("/:id/tracking", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const repositionId = parseInt(req.params.id);
+      console.log('Tracking request for reposition ID:', repositionId);
+
+      if (isNaN(repositionId)) {
+        console.log('Invalid reposition ID:', req.params.id);
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      console.log('Getting tracking data for reposition:', repositionId);
+      const tracking = await storage.getRepositionTracking(repositionId);
+      console.log('Tracking data retrieved:', tracking);
+
+      res.json(tracking);
+    } catch (error: any) {
+      console.error('Get reposition tracking error:', error);
+      res.status(500).json({ message: "Error al obtener seguimiento de la reposición", error: error.message });
+    }
+  });
+
+  router.post("/:id/cancel", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const { reason } = req.body;
+
+      if (!reason || reason.trim().length === 0) {
+        return res.status(400).json({ message: "El motivo de cancelación es obligatorio" });
+      }
+
+      if (reason.trim().length < 10) {
+        return res.status(400).json({ message: "El motivo debe tener al menos 10 caracteres" });
+      }
+
+      await storage.cancelReposition(repositionId, user.id, reason.trim());
+      res.json({ message: "Reposición cancelada correctamente" });
+    } catch (error) {
+      console.error('Cancel reposition error:', error);
+      res.status(500).json({ message: "Error al cancelar reposición" });
+    }
+  });
+
+  router.delete("/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      console.log('Delete request from user:', user.area, 'for reposition:', req.params.id);
+
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo Admin o Envíos pueden eliminar reposiciones" });
+      }
+
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      await storage.deleteReposition(repositionId, user.id);
+      console.log('Reposition deleted successfully:', repositionId);
+      res.json({ message: "Reposición eliminada correctamente" });
+    } catch (error) {
+      console.error('Delete reposition error:', error);
+      res.status(500).json({ message: "Error al eliminar reposición" });
+    }
+  });
+
+  router.post("/:id/complete", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+      const { notes } = req.body;
+
+      if (user.area === 'admin' || user.area === 'envios') {
+        // Admin y Envíos pueden finalizar directamente
+        await storage.completeReposition(repositionId, user.id, notes);
+        res.json({ message: "Reposición finalizada correctamente" });
+      } else {
+        // Check for Auto-Completion Setting
+        const autoComplete = await storage.getSystemSetting('reposition_auto_complete');
+
+        if (autoComplete === 'true') {
+          // Auto-complete enabled
+          await storage.completeReposition(repositionId, user.id, notes);
+          res.json({ message: "Reposición finalizada automáticamente por configuración" });
+        } else {
+          // Otras áreas necesitan solicitar aprobación para finalizar
+          await storage.requestCompletionApproval(repositionId, user.id, notes);
+          res.json({ message: "Solicitud de finalización enviada a administración" });
+        }
+      }
+    } catch (error) {
+      console.error('Complete reposition error:', error);
+      res.status(500).json({ message: "Error al procesar solicitud de finalización" });
+    }
+  });
+
+  router.get("/all", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo administradores o envíos pueden ver el historial completo" });
+      }
+
+      const { includeDeleted } = req.query;
+      const repositions = await storage.getAllRepositions(includeDeleted === 'true');
+      res.json(repositions);
+    } catch (error) {
+      console.error('Get all repositions error:', error);
+      res.status(500).json({ message: "Error al obtener historial de reposiciones" });
+    }
+  });
+
+  router.get("/notifications", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const notifications = await storage.getUserNotifications(user.id);
+
+      // Filtrar solo notificaciones de reposiciones no leídas
+      const repositionNotifications = notifications.filter(n =>
+        !n.read && (
+          n.type?.includes('reposition') ||
+          n.type?.includes('completion') ||
+          n.type === 'new_reposition' ||
+          n.type === 'reposition_transfer' ||
+          n.type === 'reposition_approved' ||
+          n.type === 'reposition_rejected' ||
+          n.type === 'reposition_completed' ||
+          n.type === 'reposition_deleted' ||
+          n.type === 'completion_approval_needed'
+        )
+      );
+
+      res.json(repositionNotifications);
+    } catch (error) {
+      console.error('Get reposition notifications error:', error);
+      res.status(500).json({ message: "Error al obtener notificaciones de reposición" });
+    }
+  });
+
+  router.get("/pending-count", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+
+      // Solo admin, envíos y operaciones pueden ver reposiciones pendientes
+      if (user.area !== 'admin' && user.area !== 'envios' && user.area !== 'operaciones') {
+        return res.json({ count: 0, repositions: [] });
+      }
+
+      const repositions = await storage.getAllRepositions(false);
+      const pendingRepositions = repositions.filter(r => r.status === 'pendiente');
+
+      console.log('Pending repositions found:', pendingRepositions.length);
+
+      res.json({
+        count: pendingRepositions.length,
+        repositions: pendingRepositions
+      });
+    } catch (error) {
+      console.error('Get pending repositions count error:', error);
+      res.status(500).json({ message: "Error al obtener conteo de reposiciones pendientes" });
+    }
+  });
+
+  router.post("/:id/read", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const notificationId = parseInt(req.params.id);
+      if (!notificationId) {
+        return res.status(400).json({ message: "ID de notificación inválido" });
+      }
+
+      await storage.markNotificationRead(notificationId);
+      res.json({ message: "Notificación marcada como leída" });
+    } catch (error) {
+      console.error('Mark notification read error:', error);
+      res.status(500).json({ message: "Error al marcar notificación como leída" });
+    }
+  });
+
+  router.get("/transfers/pending", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const transfers = await storage.getPendingRepositionTransfers(user.area);
+      res.json(transfers);
+    } catch (error) {
+      console.error('Get pending reposition transfers error:', error);
+      res.status(500).json({ message: "Error al obtener transferencias pendientes" });
+    }
+  });
+
+  router.post("/:id/timer/start", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      const { area } = req.body;
+
+      console.log('Timer start request:', { repositionId, userId: user.id, area, userArea: user.area });
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      if (!area) {
+        return res.status(400).json({ message: "Área requerida" });
+      }
+
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition || reposition.currentArea !== user.area) {
+        return res.status(403).json({ message: "No tienes acceso a esta reposición" });
+      }
+
+      // Verificar si el área creadora debe registrar tiempo según la nueva lógica
+      if (reposition.solicitanteArea === user.area) {
+        // Si es el área creadora, verificar si ha regresado después de circular
+        const history = await storage.getRepositionHistory(repositionId);
+
+        // Contar cuántas veces ha sido aceptada una transferencia hacia esta área
+        const transfersToCreatorArea = history.filter((entry: any) =>
+          entry.action === 'transfer_accepted' && entry.toArea === reposition.solicitanteArea
+        ).length;
+
+        // Solo debe registrar tiempo si ha regresado por transferencia
+        if (transfersToCreatorArea === 0) {
+          return res.status(400).json({ message: "El creador de la reposición no debe registrar tiempo en la primera ocasión" });
+        }
+      }
+
+      await storage.startRepositionTimer(repositionId, user.id, area);
+      res.json({
+        message: "Cronómetro iniciado correctamente",
+        repositionId,
+        area
+      });
+    } catch (error) {
+      console.error('Start timer error:', error);
+      const errorMessage = error instanceof Error ? error.message : "Error al iniciar cronómetro";
+      res.status(500).json({ message: errorMessage });
+    }
+  });
+
+  router.post("/:id/timer/stop", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition || reposition.currentArea !== user.area) {
+        return res.status(403).json({ message: "No tienes acceso a esta reposición" });
+      }
+
+      // Verificar si el área creadora debe registrar tiempo según la nueva lógica
+      if (reposition.solicitanteArea === user.area) {
+        // Si es el área creadora, verificar si ha regresado después de circular
+        const history = await storage.getRepositionHistory(repositionId);
+
+        // Contar cuántas veces ha sido aceptada una transferencia hacia esta área
+        const transfersToCreatorArea = history.filter((entry: any) =>
+          entry.action === 'transfer_accepted' && entry.toArea === reposition.solicitanteArea
+        ).length;
+
+        // Solo debe registrar tiempo si ha regresado por transferencia
+        if (transfersToCreatorArea === 0) {
+          return res.status(400).json({ message: "El creador de la reposición no debe registrar tiempo en la primera ocasión" });
+        }
+      }
+
+      const timer = await storage.stopRepositionTimer(repositionId, user.area, user.id);
+      res.json(timer);
+    } catch (error) {
+      console.error('Stop timer error:', error);
+      res.status(400).json({ message: error instanceof Error ? error.message : "Error al parar el timer" });
+    }
+  });
+
+  router.post("/:id/timer/manual", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      const { startTime, endTime, startDate, endDate } = req.body;
+
+      console.log('Manual timer request:', {
+        repositionId,
+        userArea: user.area,
+        startTime,
+        endTime,
+        startDate,
+        endDate
+      });
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition || reposition.currentArea !== user.area) {
+        return res.status(403).json({ message: "No tienes acceso a esta reposición" });
+      }
+
+      // Permitir registro de tiempo para todas las áreas
+
+      if (!startTime || !endTime || !startDate || !endDate) {
+        return res.status(400).json({ message: "Hora de inicio, fin, fecha de inicio y fecha de fin son requeridas" });
+      }
+
+      const timer = await storage.setManualRepositionTime(repositionId, user.area, user.id, startTime, endTime, startDate, endDate);
+      res.json(timer);
+    } catch (error) {
+      console.error('Set manual time error:', error);
+      res.status(400).json({ message: error instanceof Error ? error.message : "Error al registrar tiempo manual" });
+    }
+  });
+
+  router.get("/:id/timer", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const timer = await storage.getRepositionTimer(repositionId, user.area);
+      res.json(timer);
+    } catch (error) {
+      console.error('Get timer error:', error);
+      res.status(500).json({ message: "Error al obtener el timer" });
+    }
+  });
+
+  router.post("/:id/reactivate", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo Admin o Envíos pueden reactivar reposiciones" });
+      }
+
+      const repositionId = parseInt(req.params.id);
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const { reason } = req.body;
+      if (!reason || reason.trim().length === 0) {
+        return res.status(400).json({ message: "El motivo de reactivación es obligatorio" });
+      }
+
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition) {
+        return res.status(404).json({ message: "Reposición no encontrada" });
+      }
+
+      console.log('Reactivation attempt for reposition:', {
+        id: repositionId,
+        folio: reposition.folio,
+        status: reposition.status,
+        completedAt: reposition.completedAt,
+        completedAtType: typeof reposition.completedAt
+      });
+
+      if (reposition.status !== 'completado') {
+        return res.status(400).json({ message: "Solo se pueden reactivar reposiciones completadas" });
+      }
+
+      await storage.reactivateReposition(repositionId, user.id, reason.trim());
+      res.json({ message: "Reposición reactivada correctamente" });
+    } catch (error) {
+      console.error('Reactivate reposition error:', error);
+      res.status(500).json({ message: "Error al reactivar reposición" });
+    }
+  });
+
+  // Upload documents to existing reposition
+  router.post("/:id/documents", authenticateToken, upload.array('documents', 5), handleMulterError, async (req: any, res: any) => {
+    try {
+      const user = (req as any).user;
+      const repositionId = parseInt(req.params.id);
+      const files = req.files as Express.Multer.File[];
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({ message: "No se han seleccionado archivos" });
+      }
+
+      // Verify reposition exists
+      const reposition = await storage.getRepositionById(repositionId);
+      if (!reposition) {
+        return res.status(404).json({ message: "Reposición no encontrada" });
+      }
+
+      // Save documents
+      const savedDocuments = [];
+      for (const file of files) {
+        const document = await storage.saveRepositionDocument({
+          repositionId: repositionId,
+          filename: file.filename,
+          originalName: file.originalname,
+          size: file.size,
+          path: file.path,
+          uploadedBy: user.id
+        });
+        savedDocuments.push(document);
+      }
+
+      res.json({
+        message: `${savedDocuments.length} documento(s) añadido(s) correctamente`,
+        documents: savedDocuments
+      });
+    } catch (error) {
+      console.error('Upload documents error:', error);
+      res.status(500).json({ message: "Error al subir documentos" });
+    }
+  });
+
+  // Get documents for a reposition
+  router.get("/:id/documents", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+    try {
+      const repositionId = parseInt(req.params.id);
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const documents = await storage.getRepositionDocuments(repositionId);
+      res.json(documents);
+    } catch (error) {
+      console.error('Get documents error:', error);
+      res.status(500).json({ message: "Error al obtener documentos" });
+    }
+  });
+
+  // New route to get products for a reposition
+  router.get("/:id/products", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const repositionId = parseInt(req.params.id);
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      const products = await storage.getRepositionProducts(repositionId);
+      res.json(products);
+    } catch (error) {
+      console.error('Get products error:', error);
+      res.status(500).json({ message: "Error al obtener productos" });
+    }
+  });
+
+  // Endpoint de emergencia para reparar reposiciones sin fecha de finalización
+  router.post("/repair-completed", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin') {
+        return res.status(403).json({ message: "Solo administradores pueden usar esta función de reparación" });
+      }
+
+      // Buscar todas las reposiciones completadas sin fecha de finalización
+      const problematicRepositions = await db.select()
+        .from(repositions)
+        .where(and(
+          eq(repositions.status, 'completado' as RepositionStatus),
+          isNull(repositions.completedAt)
+        ));
+
+      let repaired = 0;
+      let failed = 0;
+
+      for (const reposition of problematicRepositions) {
+        try {
+          const history = await storage.getRepositionHistory(reposition.id);
+          const completedEntry = history.find(h => h.action === 'completed');
+
+          if (completedEntry) {
+            await db.update(repositions)
+              .set({ completedAt: new Date(completedEntry.createdAt) })
+              .where(eq(repositions.id, reposition.id));
+            repaired++;
+          } else {
+            failed++;
+          }
+        } catch (error) {
+          console.error(`Failed to repair reposition ${reposition.id}:`, error);
+          failed++;
+        }
+      }
+
+      res.json({
+        message: `Reparación completada: ${repaired} reposiciones reparadas, ${failed} fallaron`,
+        repaired,
+        failed,
+        total: problematicRepositions.length
+      });
+    } catch (error) {
+      console.error('Repair repositions error:', error);
+      res.status(500).json({ message: "Error al reparar reposiciones" });
+    }
+  });
+
+  // Endpoint para historial de reposiciones con filtros de tiempo
+  router.get("/history", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    const user = req.user!;
+
+    try {
+      // Obtener todas las reposiciones
+      const allRepositions = await db
+        .select()
+        .from(repositions)
+        .where(ne(repositions.status, 'eliminado'))
+        .orderBy(desc(repositions.createdAt));
+
+      // Filtrar según las reglas de visibilidad temporal
+      const now = new Date();
+      const filteredRepositions = allRepositions.filter(reposition => {
+        // Si no está finalizada, siempre es visible
+        if (!reposition.completedAt) return true;
+
+        const finalized = new Date(reposition.completedAt);
+        const hoursSinceFinalized = (now.getTime() - finalized.getTime()) / (1000 * 60 * 60);
+
+        // Admin y envíos pueden ver todas
+        if (user.area === 'admin' || user.area === 'envios') {
+          return true;
+        }
+
+        // Área solicitante puede ver por 24 horas
+        if (user.area === reposition.solicitanteArea) {
+          return hoursSinceFinalized <= 24;
+        }
+
+        // Otras áreas pueden ver por 12 horas
+        return hoursSinceFinalized <= 12;
+      });
+
+      res.json(filteredRepositions);
+    } catch (error) {
+      console.error('Error getting repositions history:', error);
+      res.status(500).json({ message: "Error al obtener el historial de reposiciones" });
+    }
+  });
+
+  // Endpoint para exportar historial de reposiciones
+  router.post("/export", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const { repositions } = req.body;
+
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('Historial de Reposiciones');
+
+      // Configurar columnas
+      worksheet.columns = [
+        { header: 'Folio', key: 'folio', width: 15 },
+        { header: 'Cliente', key: 'cliente', width: 20 },
+        { header: 'Modelo', key: 'modelo', width: 15 },
+        { header: 'Tipo', key: 'tipo', width: 15 },
+        { header: 'Piezas', key: 'piezas', width: 10 },
+        { header: 'Motivo', key: 'motivo', width: 20 },
+        { header: 'Descripción', key: 'descripcion', width: 30 },
+        { header: 'Urgencia', key: 'urgencia', width: 12 },
+        { header: 'Estado', key: 'status', width: 12 },
+        { header: 'Área Actual', key: 'currentArea', width: 15 },
+        { header: 'Área Solicitante', key: 'solicitanteArea', width: 15 },
+        { header: 'Área Causante', key: 'areaCausanteDano', width: 15 },
+        { header: 'Fecha Creación', key: 'createdAt', width: 20 },
+        { header: 'Fecha Finalización', key: 'finalizadoAt', width: 20 }
+      ];
+
+      // Agregar datos
+      repositions.forEach((reposition: any) => {
+        worksheet.addRow({
+          folio: reposition.folio,
+          cliente: reposition.cliente,
+          modelo: reposition.modelo,
+          tipo: reposition.tipo,
+          piezas: reposition.piezas,
+          motivo: reposition.motivo,
+          descripcion: reposition.descripcion,
+          urgencia: reposition.urgencia,
+          status: reposition.status === 'completado' ? 'Completado' :
+            reposition.status === 'en_proceso' ? 'En Proceso' :
+              reposition.status === 'pendiente' ? 'Pendiente' :
+                reposition.status === 'cancelado' ? 'Cancelado' : 'Pausado',
+          currentArea: reposition.currentArea,
+          solicitanteArea: reposition.solicitanteArea,
+          areaCausanteDano: reposition.areaCausanteDano || '',
+          createdAt: new Date(reposition.createdAt).toLocaleString('es-ES', { timeZone: 'America/Mexico_City' }),
+          finalizadoAt: reposition.finalizadoAt ? new Date(reposition.finalizadoAt).toLocaleString('es-ES', { timeZone: 'America/Mexico_City' }) : ''
+        });
+      });
+
+      // Estilo para header
+      worksheet.getRow(1).font = { bold: true };
+      worksheet.getRow(1).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FFE6F3FF' }
+      };
+
+      const buffer = await workbook.xlsx.writeBuffer();
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename="historial-reposiciones.xlsx"');
+      res.send(buffer);
+
+    } catch (error) {
+      console.error('Export error:', error);
+      res.status(500).json({ message: "Error al exportar datos" });
+    }
+  });
+
+
+  app.use("/api/repositions", router);
+}
+
+
+
+function registerReportsRoutes(app: Express) {
+  const router = Router();
+
+  router.get("/data", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const { type, startDate, endDate, area, status, urgency } = req.query;
+      const data = await storage.getReportData(
+        type as string,
+        startDate as string,
+        endDate as string,
+        { area: area as string, status: status as string, urgency: urgency as string }
+      );
+      res.json(data);
+    } catch (error) {
+      console.error('Get report data error:', error);
+      res.status(500).json({ message: "Error al obtener datos del reporte" });
+    }
+  });
+
+  router.get("/generate", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const { type, format, startDate, endDate, area, status, urgency } = req.query;
+      const buffer = await storage.generateReport(
+        type as string,
+        format as string,
+        startDate as string,
+        endDate as string,
+        { area: area as string, status: status as string, urgency: urgency as string }
+      );
+
+      const contentType = format === 'excel' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'application/pdf';
+      const filename = `reporte-${type}-${new Date().toISOString().split('T')[0]}.${format === 'excel' ? 'xlsx' : 'pdf'}`;
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buffer);
+    } catch (error) {
+      console.error('Generate report error:', error);
+      res.status(500).json({ message: "Error al generar reporte" });
+    }
+  });
+
+  router.post("/onedrive", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const { type, startDate, endDate, area, status, urgency } = req.query;
+      const result = await storage.saveReportToOneDrive(
+        type as string,
+        startDate as string,
+        endDate as string,
+        { area: area as string, status: status as string, urgency: urgency as string }
+      );
+      res.json(result);
+    } catch (error) {
+      console.error('Save to OneDrive error:', error);
+      res.status(500).json({ message: "Error al guardar en OneDrive" });
+    }
+  });
+
+  app.use("/api/reports", router);
+}
+
+function registerAgendaRoutes(app: Express) {
+  const router = Router();
+
+  // Obtener tareas - usuarios ven las de su área, Admin/Envíos ven todas
+  router.get("/", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const events = await storage.getAgendaEvents(user);
+      res.json(events);
+    } catch (error) {
+      console.error('Get agenda events error:', error);
+      res.status(500).json({ message: "Error al obtener tareas de la agenda" });
+    }
+  });
+
+  // Crear tarea - solo Admin/Envíos
+  router.post("/", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo Admin y Envíos pueden crear tareas" });
+      }
+
+      const { assignedToArea, title, description, date, time, priority, status } = req.body;
+      const event = await storage.createAgendaEvent({
+        createdBy: user.id,
+        assignedToArea,
+        title,
+        description,
+        date,
+        time,
+        priority,
+        status
+      });
+      res.status(201).json(event);
+    } catch (error) {
+      console.error('Create agenda event error:', error);
+      res.status(400).json({ message: "Error al crear tarea de la agenda" });
+    }
+  });
+
+  // Actualizar tarea - solo Admin/Envíos pueden editar, otras áreas solo pueden cambiar status
+  router.put("/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const eventId = parseInt(req.params.id);
+      if (isNaN(eventId)) {
+        return res.status(400).json({ message: "ID de tarea inválido" });
+      }
+
+      const { assignedToArea, title, description, date, time, priority, status } = req.body;
+
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        // Otras áreas solo pueden cambiar el status de sus tareas asignadas
+        const event = await storage.updateTaskStatus(eventId, user.area, status);
+        res.json(event);
+      } else {
+        // Admin/Envíos pueden editar completamente
+        const event = await storage.updateAgendaEvent(eventId, {
+          assignedToArea,
+          title,
+          description,
+          date,
+          time,
+          priority,
+          status
+        });
+        res.json(event);
+      }
+    } catch (error) {
+      console.error('Update agenda event error:', error);
+      res.status(500).json({ message: "Error al actualizar tarea de la agenda" });
+    }
+  });
+
+  // Eliminar tarea - solo Admin/Envíos
+  router.delete("/:id", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "Solo Admin y Envíos pueden eliminar tareas" });
+      }
+
+      const eventId = parseInt(req.params.id);
+      if (isNaN(eventId)) {
+        return res.status(400).json({ message: "ID de tarea inválido" });
+      }
+      await storage.deleteAgendaEvent(eventId);
+      res.json({ message: "Tarea eliminada correctamente" });
+    } catch (error) {
+      console.error('Delete agenda event error:', error);
+      res.status(500).json({ message: "Error al eliminar tarea" });
+    }
+  });
+
+  app.use("/api/agenda", router);
+}
+
+function registerAlmacenRoutes(app: Express) {
+  const router = Router();
+
+  // Middleware para verificar que el usuario sea de almacén
+  router.use((req, res, next) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    const user = req.user!;
+    if (user.area !== 'almacen') return res.status(403).json({ message: "Acceso restringido al área de almacén" });
+
+    next();
+  });
+
+  // Obtener todas las reposiciones para almacén
+  router.get("/repositions", async (req, res) => {
+    try {
+      const repositions = await storage.getAllRepositionsForAlmacen();
+      res.json(repositions);
+    } catch (error) {
+      console.error('Get repositions for almacen error:', error);
+      res.status(500).json({ message: "Error al obtener reposiciones" });
+    }
+  });
+
+  // Pausar reposición
+  router.post("/repositions/:id/pause", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+      const { reason } = req.body;
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      if (!reason || reason.trim().length === 0) {
+        return res.status(400).json({ message: "El motivo de pausa es obligatorio" });
+      }
+
+      await storage.pauseReposition(repositionId, reason.trim(), user.id);
+
+      // Send WebSocket notification
+      const httpServer = req.app.get('httpServer');
+      if (httpServer && httpServer.wss) {
+        const notification = {
+          type: 'notification',
+          data: {
+            type: 'reposition_paused',
+            message: `Reposición pausada por almacén`,
+            repositionId: repositionId
+          }
+        };
+
+        httpServer.wss.clients.forEach((client: any) => {
+          if (client.readyState === 1) {
+            client.send(JSON.stringify(notification));
+          }
+        });
+      }
+
+      res.json({ message: "Reposición pausada correctamente" });
+    } catch (error) {
+      console.error('Pause reposition error:', error);
+      res.status(500).json({ message: "Error al pausar reposición" });
+    }
+  });
+
+  // Reanudar reposición
+  router.post("/repositions/:id/resume", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+
+    try {
+      const user = req.user!;
+      const repositionId = parseInt(req.params.id);
+
+      if (isNaN(repositionId)) {
+        return res.status(400).json({ message: "ID de reposición inválido" });
+      }
+
+      await storage.resumeReposition(repositionId, user.id);
+
+      // Send WebSocket notification
+      const httpServer = req.app.get('httpServer');
+      if (httpServer && httpServer.wss) {
+        const notification = {
+          type: 'notification',
+          data: {
+            type: 'reposition_resumed',
+            message: `Reposición reanudada por almacén`,
+            repositionId: repositionId
+          }
+        };
+
+        httpServer.wss.clients.forEach((client: any) => {
+          if (client.readyState === 1) {
+            client.send(JSON.stringify(notification));
+          }
+        });
+      }
+
+      res.json({ message: "Reposición reanudada correctamente" });
+    } catch (error) {
+      console.error('Resume reposition error:', error);
+      res.status(500).json({ message: "Error al reanudar reposición" });
+    }
+  });
+
+  app.use("/api/almacen", router);
+}
+
+function registerMetricsRoutes(app: Express) {
+  const router = Router();
+
+  // Middleware para verificar autenticación y permisos de admin
+  router.use((req, res, next) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Autenticación requerida" });
+    }
+
+    const user = req.user!;
+    if (user.area !== 'admin') {
+      return res.status(403).json({ message: "Acceso restringido a administradores" });
+    }
+
+    next();
+  });
+
+  // Métricas mensuales
+  router.get("/monthly", async (req, res) => {
+    try {
+      const { month, year } = req.query;
+      console.log('Getting monthly metrics for:', month, year);
+      const metrics = await storage.getMonthlyMetrics(parseInt(month as string), parseInt(year as string));
+      console.log('Monthly metrics result:', metrics);
+      res.json(metrics);
+    } catch (error) {
+      console.error('Get monthly metrics error:', error);
+      res.status(500).json({ message: "Error al obtener métricas mensuales" });
+    }
+  });
+
+  // Métricas generales
+  router.get("/overall", async (req, res) => {
+    try {
+      console.log('Getting overall metrics');
+      const metrics = await storage.getOverallMetrics();
+      console.log('Overall metrics result:', metrics);
+      res.json(metrics);
+    } catch (error) {
+      console.error('Get overall metrics error:', error);
+      res.status(500).json({ message: "Error al obtener métricas generales" });
+    }
+  });
+
+  // Análisis por número de solicitud
+  router.get("/requests", async (req, res) => {
+    try {
+      console.log('Getting request analysis');
+      const analysis = await storage.getRequestAnalysis();
+      console.log('Request analysis result:', analysis);
+      res.json(analysis);
+    } catch (error) {
+      console.error('Get request analysis error:', error);
+      res.status(500).json({ message: "Error al obtener análisis de solicitudes" });
+    }
+  });
+
+  // Exportar métricas
+  router.get("/export/:type", async (req, res) => {
+    try {
+      const { type } = req.params;
+      const { month, year } = req.query;
+
+      let buffer;
+      let filename;
+
+      switch (type) {
+        case 'monthly':
+          buffer = await storage.exportMonthlyMetrics(parseInt(month as string), parseInt(year as string));
+          filename = `metricas-mensuales-${month}-${year}.xlsx`;
+          break;
+        case 'overall':
+          buffer = await storage.exportOverallMetrics();
+          filename = `metricas-generales-${new Date().toISOString().split('T')[0]}.xlsx`;
+          break;
+        case 'requests':
+          buffer = await storage.exportRequestAnalysis();
+          filename = `analisis-solicitudes-${new Date().toISOString().split('T')[0]}.xlsx`;
+          break;
+        case 'causativeArea':
+          buffer = await storage.exportCausativeAreaMetrics(parseInt(month as string), parseInt(year as string));
+          filename = `metricas-causativeArea-${month}-${year}.xlsx`;
+          break;
+        default:
+          return res.status(400).json({ message: "Tipo de exportación inválido" });
+      }
+
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buffer);
+    } catch (error) {
+      console.error('Export metrics error:', error);
+      res.status(500).json({ message: "Error al exportar métricas" });
+    }
+  });
+
+  app.use("/api/metrics", router);
+
+  // Download file endpoint - moved outside almacen router
+  app.get('/api/files/:filename', authenticateToken, async (req, res) => {
+    try {
+      const { filename } = req.params;
+      const filePath = path.join(process.cwd(), 'uploads', filename);
+
+      // Verificar que el archivo existe
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Archivo no encontrado' });
+      }
+
+      // Enviar el archivo con headers apropiados
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.download(filePath, (err) => {
+        if (err) {
+          console.error('Error sending file:', err);
+          if (!res.headersSent) {
+            res.status(500).json({ error: 'Error al descargar el archivo' });
+          }
+        }
+      });
+    } catch (error) {
+      console.error('Error downloading file:', error);
+      res.status(500).json({ error: 'Error al descargar el archivo' });
+    }
+  });
+}
+
+// Corrected timer validation logic in reposition routes to accurately determine when creator areas should register time.
+function registerSettingsRoutes(app: Express) {
+  const router = Router();
+
+  router.get("/:key", async (req, res) => {
+    try {
+      const key = req.params.key;
+      const publicKeys = ['maintenance_mode', 'maintenance_duration', 'maintenance_start_time'];
+
+      if (!req.isAuthenticated() && !publicKeys.includes(key)) {
+        return res.status(401).json({ message: "Autenticación requerida" });
+      }
+
+      const value = await storage.getSystemSetting(key);
+      console.log(`DEBUG: GET setting ${key} = ${value}`);
+      res.json({ key, value: value || null });
+    } catch (error) {
+      console.error('Get setting error:', error);
+      res.status(500).json({ message: "Error al obtener configuración" });
+    }
+  });
+
+  router.use((req, res, next) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Autenticación requerida" });
+    next();
+  });
+
+  router.post("/", async (req, res) => {
+    try {
+      const user = req.user!;
+      if (user.area !== 'admin' && user.area !== 'envios') {
+        return res.status(403).json({ message: "No autorizado para cambiar configuraciones" });
+      }
+
+      const { key, value } = req.body;
+      console.log(`DEBUG: SET setting ${key} = ${value} (User: ${user.id})`);
+
+      if (!key) {
+        return res.status(400).json({ message: "Clave de configuración requerida" });
+      }
+
+      await storage.setSystemSetting(key, String(value), user.id);
+
+      // Broadcast maintenance mode change via WebSocket
+      if (key === 'maintenance_mode') {
+        const wss = (global as any).wss;
+        if (wss) {
+          wss.clients.forEach((client: any) => {
+            if (client.readyState === 1) { // WebSocket.OPEN
+              client.send(JSON.stringify({
+                type: 'maintenance',
+                enabled: value === 'true' || value === true
+              }));
+            }
+          });
+          console.log(`Mantenimiento ${value === 'true' || value === true ? 'activado' : 'desactivado'} y notificado por WebSocket`);
+        }
+      }
+
+      res.json({ message: "Configuración actualizada" });
+    } catch (error) {
+      console.error('Set setting error:', error);
+      res.status(500).json({ message: "Error al actualizar configuración" });
+    }
+  });
+
+  app.use("/api/settings", router);
+}
