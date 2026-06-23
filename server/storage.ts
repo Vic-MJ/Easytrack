@@ -3223,6 +3223,9 @@ export class DatabaseStorage implements IStorage {
         }
       }
 
+      // Desactivar temporalmente todas las restricciones de claves foráneas y triggers
+      await db.execute(sql`SET session_replication_role = 'replica';`);
+
       let restored = {
         users: 0,
         notifications: 0,
@@ -3541,6 +3544,9 @@ export class DatabaseStorage implements IStorage {
       }
 
       throw new Error(`Error al restaurar el sistema completo: ${error.message}`);
+    } finally {
+      // Reactivar restricciones de claves foráneas y triggers
+      await db.execute(sql`SET session_replication_role = 'origin';`);
     }
   }
   async getSystemSetting(key: string): Promise<string | undefined> {
