@@ -15,6 +15,7 @@ import { useToast } from "@/hooks/use-toast";
 import { apiRequest } from "@/lib/queryClient";
 import { Settings, Users, RotateCcw, Shield, TrendingUp, Package, Trash2, Download, Database, Bell, FileText, Activity, AlertTriangle, Upload, Loader2, CheckCircle, XCircle, Cpu, Zap, Server, ArrowDownAZ, ShieldAlert, Star, Clock } from "lucide-react";
 import Swal from 'sweetalert2';
+import { Progress } from "@/components/ui/progress";
 
 import { FestivityModal } from "@/components/admin/festivity-modal";
 import { BackupConfigModal } from "@/components/admin/backup-config-modal";
@@ -51,6 +52,27 @@ export default function AdminPage() {
   const [isPgBackingUp, setIsPgBackingUp] = useState(false);
   const [showFestivityModal, setShowFestivityModal] = useState(false);
   const [showBackupConfigModal, setShowBackupConfigModal] = useState(false);
+  const [dbProgress, setDbProgress] = useState(0);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    const isActive = isRestoring || isBackingUp || isClearingDatabase || isPgRestoring || isPgBackingUp;
+    if (isActive) {
+      setDbProgress(0);
+      interval = setInterval(() => {
+        setDbProgress((prev) => {
+          if (prev >= 95) return 95;
+          const increment = prev < 50 ? 5 : (prev < 80 ? 2 : 1);
+          return prev + increment;
+        });
+      }, 150);
+    } else {
+      setDbProgress(0);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isRestoring, isBackingUp, isClearingDatabase, isPgRestoring, isPgBackingUp]);
 
   const { data: maintenanceSetting, refetch: refetchMaintenance } = useQuery({
     queryKey: ["/api/settings/maintenance_mode"],
@@ -1618,8 +1640,9 @@ export default function AdminPage() {
                 </p>
               </div>
 
-              <div className="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700 overflow-hidden">
-                <div className="bg-blue-600 h-2.5 rounded-full animate-progress-indeterminate"></div>
+              <div className="w-full space-y-2">
+                <Progress value={dbProgress} className="w-full h-3" />
+                <p className="text-sm font-bold text-blue-600 dark:text-blue-400">{dbProgress}%</p>
               </div>
             </div>
           </div>
