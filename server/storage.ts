@@ -2782,24 +2782,28 @@ export class DatabaseStorage implements IStorage {
     console.log('Starting complete database clear...');
 
     try {
-      // Eliminar en orden específico debido a las dependencias de claves foráneas
-      await db.delete(documents);
-      await db.delete(repositionTimers);
-      await db.delete(repositionTransfers);
-      await db.delete(repositionHistory);
-      await db.delete(repositionMaterials);
-      await db.delete(repositionProducts);
-      await db.delete(repositionContrastFabrics);
-      await db.delete(repositionPieces);
-      await db.delete(repositions);
-      await db.delete(notifications);
-      await db.delete(agendaEvents);
-      await db.delete(adminPasswords);
+      // Usar TRUNCATE con CASCADE para limpiar todas las tablas dependientes de forma segura y rápida
+      await db.execute(sql`
+        TRUNCATE TABLE 
+          documents, 
+          reposition_timers, 
+          reposition_transfers, 
+          reposition_history, 
+          reposition_materials, 
+          reposition_products, 
+          reposition_contrast_fabrics, 
+          reposition_pieces, 
+          repositions, 
+          notifications, 
+          agenda_events, 
+          admin_passwords 
+        RESTART IDENTITY CASCADE;
+      `);
 
       // Solo eliminar usuarios si está marcada la opción
       if (deleteUsers) {
         console.log('Deleting users (except admin)...');
-        await db.delete(users).where(ne(users.area, 'admin'));
+        await db.execute(sql`DELETE FROM users WHERE area != 'admin';`);
       }
 
       console.log('Database cleared successfully');
