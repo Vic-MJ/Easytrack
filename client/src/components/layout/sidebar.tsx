@@ -155,7 +155,7 @@ export function CustomSidebar({ onShowNotifications, onCreateReposition }: Custo
       <SidebarHeader className="border-b bg-[var(--jasana-sidebar-bg)]">
         <div className="flex items-center gap-3 px-2 py-2">
           <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-[var(--jasana-accent)]/20 to-[var(--jasana-primary)]/20 shadow-md dark:from-[var(--jasana-accent)]/30 dark:to-[var(--jasana-primary)]/30">
-            <img src="../../../public/icon.svg" alt="Logo" className="h-10 w-10 object-contain" />
+            <img src="/icon.svg" alt="Logo" className="h-10 w-10 object-contain" />
           </div>
           <div className="flex flex-col group-data-[collapsible=icon]:hidden">
             <h1 className="text-xl font-bold bg-gradient-to-r from-purple-500 via-pink-400 to-purple-700 bg-clip-text text-transparent">
