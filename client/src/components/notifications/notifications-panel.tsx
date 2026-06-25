@@ -32,6 +32,7 @@ import { useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { format, isToday, isYesterday, isThisWeek, parseISO } from "date-fns";
 import { es } from "date-fns/locale";
+import { NotificationPermission } from "./notification-permission";
 
 interface NotificationsPanelProps {
   open: boolean;
@@ -372,6 +373,9 @@ export function NotificationsPanel({ open, onClose }: NotificationsPanelProps) {
         {/* Content */}
         <ScrollArea className="flex-1 px-4 sm:px-6 bg-slate-50/50 dark:bg-transparent">
           <div className="py-6 space-y-8 min-h-full">
+            
+            {/* Banner for push notifications */}
+            <NotificationPermission />
 
             {totalNotifications === 0 && <EmptyState />}
 

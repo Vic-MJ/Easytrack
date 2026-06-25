@@ -832,6 +832,7 @@ function configureWebSocket(app: Express): Server {
   // Exponer función debroadcast
   (httpServer as any).wss = wss;
   (httpServer as any).broadcast = broadcastToAll;
+  (global as any).wss = wss;
 
   // Store httpServer reference in app for access in routes
   app.set('httpServer', httpServer);

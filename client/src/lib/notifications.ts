@@ -32,7 +32,7 @@ export class NotificationService {
 
     const permission = await Notification.requestPermission();
     this.permission = permission;
-    
+
     return permission === 'granted';
   }
 
@@ -40,28 +40,43 @@ export class NotificationService {
     try {
       // Crear un contexto de audio
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      
-      // Crear oscilador para generar el sonido
-      const oscillator = audioContext.createOscillator();
-      const gainNode = audioContext.createGain();
-      
-      // Conectar oscilador al gain y luego al destino
-      oscillator.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-      
-      // Configurar el sonido (tipo campana/notification)
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(800, audioContext.currentTime);
-      oscillator.frequency.exponentialRampToValueAtTime(600, audioContext.currentTime + 0.1);
-      
-      // Configurar volumen
-      gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
-      
-      // Reproducir sonido
-      oscillator.start(audioContext.currentTime);
-      oscillator.stop(audioContext.currentTime + 0.3);
-      
+
+      // Configurar volumen principal para que no sea muy fuerte
+      const masterGain = audioContext.createGain();
+      masterGain.connect(audioContext.destination);
+      masterGain.gain.value = 0.4;
+
+      // Primer tono (Ding)
+      const osc1 = audioContext.createOscillator();
+      const gain1 = audioContext.createGain();
+      osc1.connect(gain1);
+      gain1.connect(masterGain);
+
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(783.99, audioContext.currentTime); // Nota Sol (G5)
+      gain1.gain.setValueAtTime(1, audioContext.currentTime);
+      gain1.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.4);
+
+      osc1.start(audioContext.currentTime);
+      osc1.stop(audioContext.currentTime + 0.4);
+
+      // Segundo tono (Dong) - un poco más grave y retrasado
+      const osc2 = audioContext.createOscillator();
+      const gain2 = audioContext.createGain();
+      osc2.connect(gain2);
+      gain2.connect(masterGain);
+
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(523.25, audioContext.currentTime + 0.15); // Nota Do (C5)
+
+      // Empieza en silencio, sube cuando le toca y luego baja
+      gain2.gain.setValueAtTime(0, audioContext.currentTime);
+      gain2.gain.setValueAtTime(1, audioContext.currentTime + 0.15);
+      gain2.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.8);
+
+      osc2.start(audioContext.currentTime + 0.15);
+      osc2.stop(audioContext.currentTime + 0.8);
+
     } catch (error) {
       console.warn('No se pudo reproducir el sonido de notificación:', error);
     }
@@ -81,15 +96,15 @@ export class NotificationService {
       return;
     }
 
-    // Si la página está visible, no mostrar notificación
-    if (document.visibilityState === 'visible') {
-      return;
-    }
+    // Si la página está visible, no mostrar notificación (comentado para que siempre avise)
+    // if (document.visibilityState === 'visible') {
+    //   return;
+    // }
 
     const defaultOptions = {
       icon: '/icono_pestaña.png',
       badge: '/icono_pestaña.png',
-      requireInteraction: true,
+      requireInteraction: false, // Falso para que Windows permita eliminarla de la barra lateral al hacer .close()
       silent: false,
       ...options
     };
@@ -101,12 +116,12 @@ export class NotificationService {
       }
 
       const notification = new Notification(title, defaultOptions);
-      
+
       notification.onclick = (event) => {
         event.preventDefault();
         window.focus();
         notification.close();
-        
+
         // Si hay datos específicos, navegar a la página correspondiente
         if (options.data?.path) {
           window.location.hash = options.data.path;
@@ -116,7 +131,7 @@ export class NotificationService {
       // Auto cerrar después de 5 segundos
       setTimeout(() => {
         notification.close();
-      }, 5000);
+      }, 15000);
 
     } catch (error) {
       console.error('Error al mostrar notificación:', error);
@@ -147,14 +162,14 @@ export function formatNotificationContent(notification: any): {
         body: message || 'Se ha creado una nueva orden',
         data: { path: '#/orders' }
       };
-    
+
     case 'order_completed':
       return {
         title: '✅ Orden Completada',
         body: message || `Orden ${orderId} completada`,
         data: { path: '#/orders' }
       };
-    
+
     case 'new_reposition':
     case 'reposition_created':
       return {
@@ -162,21 +177,21 @@ export function formatNotificationContent(notification: any): {
         body: message || 'Se ha creado una nueva reposición',
         data: { path: '#/repositions' }
       };
-    
+
     case 'reposition_approved':
       return {
         title: '✅ Reposición Aprobada',
         body: message || `Reposición ${repositionId} aprobada`,
         data: { path: '#/repositions' }
       };
-    
+
     case 'reposition_rejected':
       return {
         title: '❌ Reposición Rechazada',
         body: message || `Reposición ${repositionId} rechazada`,
         data: { path: '#/repositions' }
       };
-    
+
     case 'transfer':
     case 'reposition_transfer':
       return {
@@ -184,21 +199,21 @@ export function formatNotificationContent(notification: any): {
         body: message || 'Nueva transferencia procesada',
         data: { path: '#/orders' }
       };
-    
+
     case 'completion_approval_needed':
       return {
         title: '⏰ Aprobación Necesaria',
         body: message || 'Se requiere aprobación para completar',
         data: { path: '#/orders' }
       };
-    
+
     case 'partial_transfer_warning':
       return {
         title: '⚠️ Transferencia Parcial',
         body: message || 'Advertencia de transferencia parcial',
         data: { path: '#/orders' }
       };
-    
+
     default:
       return {
         title: '🔔 Nueva Notificación',

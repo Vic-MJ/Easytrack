@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { NotificationService, formatNotificationContent } from './notifications';
 
+import { useAuth } from "@/hooks/use-auth";
+
 class WebSocketManager {
   private ws: WebSocket | null = null;
   private reconnectAttempts = 0;
@@ -96,6 +98,7 @@ const globalWebSocketManager = new WebSocketManager();
 export function useWebSocket() {
   const [isConnected, setIsConnected] = useState(false);
   const queryClient = useQueryClient();
+  const { user } = useAuth(); // Obtener el usuario actual
 
   useEffect(() => {
     globalWebSocketManager.connect();
@@ -105,6 +108,12 @@ export function useWebSocket() {
       if (message.type !== 'notification') return;
 
       const notification = message.data;
+      
+      // Si la notificación tiene un userId específico y no coincide con el usuario actual, ignorar
+      if (notification.userId && user && notification.userId !== user.id) {
+        return;
+      }
+      
       console.log('Nueva notificación recibida:', notification);
 
       // Invalidar queries relacionadas para actualizar la UI

@@ -161,7 +161,7 @@ export function CustomSidebar({ onShowNotifications, onCreateReposition }: Custo
             <h1 className="text-xl font-bold bg-gradient-to-r from-purple-500 via-pink-400 to-purple-700 bg-clip-text text-transparent">
               JASANA
             </h1>
-            <p className="text-xs text-muted-foreground">V8.0.3 Jun26</p>
+            <p className="text-xs text-muted-foreground">V8.0.4 Jun26</p>
             <p className="text-xs text-muted-foreground">&copy; 2026 Desarrollado Por ClerDevs-Code</p>
           </div>
           <SidebarTrigger className="ml-auto h-6 w-6 group-data-[collapsible=icon]:ml-0" />
