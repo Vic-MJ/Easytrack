@@ -10,7 +10,7 @@ import { Switch } from '@/components/ui/switch';
 import { Calendar } from '@/components/ui/calendar';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { Plus, Eye, ArrowRight, CheckCircle, XCircle, Clock, MapPin, Activity, Trash2, Flag, Bell, Search, Play, Square, Printer, CalendarIcon, X, Edit, Settings, ChevronDown, ChevronUp } from 'lucide-react';
+import { Plus, Eye, ArrowRight, CheckCircle, XCircle, Clock, MapPin, Activity, Trash2, Flag, Bell, Search, Play, Square, Printer, CalendarIcon, X, Edit, Settings, ChevronDown, ChevronUp, User } from 'lucide-react';
 import { useAuth } from '@/hooks/use-auth';
 import { RepositionForm } from './RepositionForm';
 import { RepositionDetail } from './RepositionDetail';
@@ -36,6 +36,7 @@ interface Reposition {
   completedAt?: string;
   noSolicitud?: string;
   tipoAccidente?: string;
+  operatorName?: string | null;
 }
 
 const areas = [
@@ -1858,6 +1859,15 @@ export function RepositionList({ userArea }: { userArea: string }) {
                           })}
                         </span>
                       </div>
+                      {reposition.operatorName && (
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-semibold text-gray-400 dark:text-gray-500">Operario:</span>
+                          <span className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 px-1.5 py-0.5 rounded font-medium flex items-center gap-1">
+                            <User className="h-3 w-3 inline" />
+                            {reposition.operatorName}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
 

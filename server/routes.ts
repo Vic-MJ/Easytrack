@@ -963,7 +963,32 @@ function registerRepositionRoutes(app: Express) {
         repositions = await storage.getRepositionsByArea(user.area, user.id);
       }
 
-      res.json(repositions);
+      // Agregar nombre del operario actual (Operario)
+      const repositionsWithOperator = await Promise.all(repositions.map(async (repo: any) => {
+        let operatorName = null;
+        
+        const [lastTransfer] = await db.query.repositionTransfers.findMany({
+          where: and(
+            eq(repositionTransfers.repositionId, repo.id),
+            eq(repositionTransfers.toArea, repo.currentArea),
+            eq(repositionTransfers.status, 'accepted')
+          ),
+          orderBy: desc(repositionTransfers.createdAt),
+          limit: 1,
+          with: { processor: true }
+        });
+
+        if (lastTransfer && lastTransfer.processor) {
+          operatorName = lastTransfer.processor.name;
+        } else if (repo.currentArea === repo.solicitanteArea) {
+           const creator = await storage.getUser(repo.createdBy);
+           operatorName = creator ? creator.name : null;
+        }
+
+        return { ...repo, operatorName };
+      }));
+
+      res.json(repositionsWithOperator);
     } catch (error) {
       console.error('Get repositions error:', error);
       res.status(500).json({ message: "Error al cargar las reposiciones" });
