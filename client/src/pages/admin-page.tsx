@@ -793,8 +793,8 @@ export default function AdminPage() {
 
                       <div className="mt-8 pt-6 border-t border-slate-100 dark:border-slate-800/50 flex items-center justify-between">
                         <div className="text-xs text-slate-400">
-                          <span className="block font-bold text-slate-600 dark:text-slate-300">v8.0.4</span>
-                          Compilado 2026.06
+                          <span className="block font-bold text-slate-600 dark:text-slate-300">9.1.1</span>
+                          Compilado 2026.07
                         </div>
                         <div className="flex gap-1">
                           <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
