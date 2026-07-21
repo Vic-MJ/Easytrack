@@ -182,7 +182,10 @@ export function RepositionForm({ onClose, repositionId }: { onClose: () => void;
             consumoTela: product.consumoTela || 0,
             pieces: existingPieces
               .filter((piece: any) => {
-                // Distribuir las piezas entre los productos
+                if (piece.repositionProductId) {
+                  return piece.repositionProductId === product.id;
+                }
+                // Distribuir las piezas entre los productos (retrocompatibilidad)
                 const piecesPerProduct = Math.ceil(existingPieces.length / existingProducts.length);
                 const startIndex = index * piecesPerProduct;
                 const endIndex = startIndex + piecesPerProduct;

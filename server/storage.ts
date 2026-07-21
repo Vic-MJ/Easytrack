@@ -2973,23 +2973,82 @@ export class DatabaseStorage implements IStorage {
 
     console.log('Existing pieces, products, and contrast fabrics deleted');
 
-    // Insert new products if they exist
+    // Insert new products and their pieces
     if (productos && productos.length > 0) {
-      const productValues = productos.map((producto: any) => ({
-        repositionId,
-        modeloPrenda: producto.modeloPrenda,
-        tela: producto.tela,
-        color: producto.color,
-        tipoPieza: producto.tipoPieza,
-        consumoTela: producto.consumoTela || 0,
-      }));
+      try {
+        const productPromises = productos.map(async (producto: any) => {
+          // 1. Insert product
+          let newProduct;
+          try {
+            [newProduct] = await db.insert(repositionProducts)
+              .values({
+                repositionId,
+                modeloPrenda: producto.modeloPrenda,
+                tela: producto.tela,
+                color: producto.color,
+                tipoPieza: producto.tipoPieza,
+                consumoTela: producto.consumoTela || 0,
+              })
+              .returning();
+          } catch (err: any) {
+            if (err.code === '23505' && err.constraint === 'reposition_products_pkey') {
+              console.log('Error secuencia reposition_products en update. Corrigiendo...');
+              await db.execute(sql`SELECT setval('reposition_products_id_seq', (SELECT MAX(id) FROM reposition_products))`);
+              [newProduct] = await db.insert(repositionProducts)
+                .values({
+                  repositionId,
+                  modeloPrenda: producto.modeloPrenda,
+                  tela: producto.tela,
+                  color: producto.color,
+                  tipoPieza: producto.tipoPieza,
+                  consumoTela: producto.consumoTela || 0,
+                })
+                .returning();
+            } else {
+              throw err;
+            }
+          }
 
-      await db.insert(repositionProducts).values(productValues);
-      console.log('New products inserted:', productValues.length);
-    }
+          // 2. Insert product pieces
+          if (producto.pieces && producto.pieces.length > 0) {
+            try {
+              await db.insert(repositionPieces)
+                .values(producto.pieces.map((piece: any) => ({
+                  repositionId,
+                  repositionProductId: newProduct.id,
+                  talla: piece.talla,
+                  cantidad: typeof piece.cantidad === 'string' ? parseInt(piece.cantidad, 10) : piece.cantidad,
+                  unit: piece.unit || 'piezas',
+                  folioOriginal: piece.folioOriginal || null,
+                })));
+            } catch (err: any) {
+              if (err.code === '23505' && err.constraint === 'reposition_pieces_pkey') {
+                console.log('Error secuencia reposition_pieces en update. Corrigiendo...');
+                await db.execute(sql`SELECT setval('reposition_pieces_id_seq', (SELECT MAX(id) FROM reposition_pieces))`);
+                await db.insert(repositionPieces)
+                  .values(producto.pieces.map((piece: any) => ({
+                    repositionId,
+                    repositionProductId: newProduct.id,
+                    talla: piece.talla,
+                    cantidad: typeof piece.cantidad === 'string' ? parseInt(piece.cantidad, 10) : piece.cantidad,
+                    unit: piece.unit || 'piezas',
+                    folioOriginal: piece.folioOriginal || null,
+                  })));
+              } else {
+                throw err;
+              }
+            }
+          }
+        });
 
-    // Insert new pieces
-    if (pieces && pieces.length > 0) {
+        await Promise.all(productPromises);
+        console.log('New products and their pieces inserted');
+      } catch (error: any) {
+        console.error('Error al guardar productos y piezas en update:', error);
+        throw error;
+      }
+    } else if (pieces && pieces.length > 0) {
+      // Legacy or no-product repositions
       const pieceValues = pieces.map((piece: any) => ({
         repositionId,
         talla: piece.talla,
@@ -2999,7 +3058,7 @@ export class DatabaseStorage implements IStorage {
       }));
 
       await db.insert(repositionPieces).values(pieceValues);
-      console.log('New pieces inserted:', pieceValues.length);
+      console.log('New pieces inserted (legacy format):', pieceValues.length);
     }
 
     // Insert new contrast fabrics if they exist
