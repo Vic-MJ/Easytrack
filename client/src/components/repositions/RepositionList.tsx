@@ -308,7 +308,7 @@ export function RepositionList({ userArea }: { userArea: string }) {
   const [selectedReposition, setSelectedReposition] = useState<number | null>(null);
   const [trackedReposition, setTrackedReposition] = useState<number | null>(null);
   const [printSummaryReposition, setPrintSummaryReposition] = useState<number | null>(null);
-  const [filterArea, setFilterArea] = useState<string>(userArea === 'admin' || userArea === 'envios' || userArea === 'diseño' ? 'all' : userArea);
+  const [filterArea, setFilterArea] = useState<string>(userArea === 'admin' || userArea === 'envios' ? 'all' : userArea);
   const [showHistory, setShowHistory] = useState(false);
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -1476,18 +1476,16 @@ export function RepositionList({ userArea }: { userArea: string }) {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <h1 className="text-3xl font-bold text-purple-800">
-          {userArea === 'diseño' ? 'Reposiciones Aprobadas' : 'Solicitudes de Reposición'}
+          Solicitudes de Reposición
         </h1>
         <div className="flex gap-2">
           {(userArea === 'admin' || userArea === 'envios') && (
             <RepositionSettingsDialog />
           )}
-          {userArea !== 'diseño' && (
-            <Button onClick={() => setShowForm(true)} className="bg-purple-600 hover:bg-purple-700">
-              <Plus className="w-4 h-4 mr-2" />
-              Nueva Solicitud
-            </Button>
-          )}
+          <Button onClick={() => setShowForm(true)} className="bg-purple-600 hover:bg-purple-700">
+            <Plus className="w-4 h-4 mr-2" />
+            Nueva Solicitud
+          </Button>
         </div>
       </div>
 
@@ -1678,14 +1676,14 @@ export function RepositionList({ userArea }: { userArea: string }) {
         )}
       </Card>
 
-      {(userArea === 'admin' || userArea === 'envios' || userArea === 'diseño' || userArea === 'almacen') && (
+      {(userArea === 'admin' || userArea === 'envios' || userArea === 'almacen') && (
         <>
           <Select value={filterArea} onValueChange={setFilterArea}>
             <SelectTrigger className="w-48 bg-white dark:bg-slate-800 border-gray-300 dark:border-slate-600 text-gray-900 dark:text-gray-100">
               <SelectValue placeholder="Filtrar por área" />
             </SelectTrigger>
             <SelectContent className="bg-white dark:bg-slate-800 border-gray-300 dark:border-slate-700">
-              <SelectItem value="all" className="text-gray-900 dark:text-gray-100">{(userArea === 'diseño' || userArea === 'almacen') ? 'Todas las aprobadas' : 'Todas las áreas'}</SelectItem>
+              <SelectItem value="all" className="text-gray-900 dark:text-gray-100">{userArea === 'almacen' ? 'Todas las aprobadas' : 'Todas las áreas'}</SelectItem>
               {areas.map(area => (
                 <SelectItem key={area} value={area} className="text-gray-900 dark:text-gray-100">
                   {area.charAt(0).toUpperCase() + area.slice(1)}
