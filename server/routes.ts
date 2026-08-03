@@ -32,17 +32,17 @@ export function registerRoutes(app: Express): Server {
       const { spawn, exec } = await import('child_process');
       const { promisify } = await import('util');
       const execAsync = promisify(exec);
-      
+
       const filePath = req.file.path;
       const fileExtension = req.file.originalname.toLowerCase().split('.').pop();
-      
+
       if (createDbFirst) {
         try {
           // Extraer la URL sin la BD para conectarse a la bd por defecto de postgres
           const baseUrl = connectionString.substring(0, connectionString.lastIndexOf('/'));
           const defaultDbUrl = `${baseUrl}/postgres`;
           const dbName = connectionString.substring(connectionString.lastIndexOf('/') + 1);
-          
+
           console.log(`Intentando crear la base de datos ${dbName}...`);
           // ignoramos si ya existe el error usando psql
           await execAsync(`psql -d "${defaultDbUrl}" -c "CREATE DATABASE \\"${dbName}\\";"`);
@@ -53,30 +53,30 @@ export function registerRoutes(app: Express): Server {
       }
 
       console.log('Restaurando BD desde archivo inicial:', filePath, 'Extension:', fileExtension);
-      
+
       let childProcess;
       if (fileExtension === 'sql') {
         childProcess = spawn('psql', ['-d', connectionString, '-f', filePath]);
       } else {
         childProcess = spawn('pg_restore', ['-c', '--if-exists', '-1', '-d', connectionString, filePath]);
       }
-      
+
       childProcess.stderr.on('data', (data: any) => {
         console.log(`Restore Init stderr: ${data}`);
       });
-      
+
       childProcess.on('error', (err: any) => {
         console.error('Error fatal al ejecutar psql/pg_restore para restore-init:', err);
         fs.unlink(filePath, (unlinkErr) => {
           if (unlinkErr) console.error("Error al eliminar archivo temporal de restore init en fallback de error:", unlinkErr);
         });
         if (!res.headersSent) {
-          res.status(500).json({ 
-            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          res.status(500).json({
+            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.`
           });
         }
       });
-      
+
       childProcess.on('close', (code: number) => {
         // Limpiar el archivo subido
         fs.unlink(filePath, (err) => {
@@ -470,13 +470,13 @@ function registerAdminRoutes(app: Express) {
 
   router.get("/pg-backup", async (req, res) => {
     if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
-    
+
     try {
       const format = (req.query.format as string) || 'custom'; // custom, plain, tar
       let pgFormat = 'c';
       let extension = 'backup';
       let mimeType = 'application/octet-stream';
-      
+
       if (format === 'plain') {
         pgFormat = 'p';
         extension = 'sql';
@@ -486,36 +486,36 @@ function registerAdminRoutes(app: Express) {
         extension = 'tar';
         mimeType = 'application/x-tar';
       }
-      
+
       const filename = `jasana-db-${format}-${new Date().toISOString().split('T')[0]}.${extension}`;
-      
+
       res.setHeader('Content-Type', mimeType);
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      
+
       const connectionString = process.env.DATABASE_URL || "postgresql://postgres:12345@localhost:5432/jasanaordenes";
       const { spawn } = await import('child_process');
       const pgDump = spawn('pg_dump', ['-F', pgFormat, '-d', connectionString]);
-      
+
       pgDump.stdout.pipe(res);
-      
+
       pgDump.stderr.on('data', (data: any) => {
         console.error(`pg_dump stderr: ${data}`);
       });
-      
+
       pgDump.on('error', (err: any) => {
         console.error('Error fatal al ejecutar pg_dump para backup:', err);
         if (!res.headersSent) {
-          res.status(500).json({ 
-            message: `Error al generar el respaldo: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          res.status(500).json({
+            message: `Error al generar el respaldo: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.`
           });
         }
       });
-      
+
       pgDump.on('close', (code: number) => {
         if (code !== 0) {
           console.error(`pg_dump process exited with code ${code}`);
           if (!res.headersSent) {
-             res.status(500).json({ message: "Error al generar el respaldo de la base de datos" });
+            res.status(500).json({ message: "Error al generar el respaldo de la base de datos" });
           }
         }
       });
@@ -529,7 +529,7 @@ function registerAdminRoutes(app: Express) {
 
   router.post("/pg-restore", uploadBackup.single('backup'), handleMulterError, async (req: any, res: any) => {
     if (req.user?.area !== 'admin') return res.status(403).json({ message: "Se requiere acceso de administrador" });
-    
+
     try {
       if (!req.file) {
         return res.status(400).json({ message: "No se proporcionó archivo de respaldo" });
@@ -539,9 +539,9 @@ function registerAdminRoutes(app: Express) {
       const { spawn } = await import('child_process');
       const filePath = req.file.path;
       const fileExtension = req.file.originalname.toLowerCase().split('.').pop();
-      
+
       console.log('Restaurando BD desde archivo:', filePath, 'Extension:', fileExtension);
-      
+
       let childProcess;
       if (fileExtension === 'sql') {
         // Para texto plano, usar psql
@@ -551,23 +551,23 @@ function registerAdminRoutes(app: Express) {
         // -c = clean (drop objects before recreating), -1 = single transaction
         childProcess = spawn('pg_restore', ['-c', '--if-exists', '-1', '-d', connectionString, filePath]);
       }
-      
+
       childProcess.stderr.on('data', (data: any) => {
         console.log(`Restore stderr: ${data}`);
       });
-      
+
       childProcess.on('error', (err: any) => {
         console.error('Error fatal al ejecutar psql/pg_restore para restore:', err);
         fs.unlink(filePath, (unlinkErr) => {
           if (unlinkErr) console.error("Error al eliminar archivo temporal de restore en fallback de error:", unlinkErr);
         });
         if (!res.headersSent) {
-          res.status(500).json({ 
-            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.` 
+          res.status(500).json({
+            message: `Error al restaurar la base de datos: ${err.message}. Asegúrese de que PostgreSQL esté instalado y en la variable de entorno PATH.`
           });
         }
       });
-      
+
       childProcess.on('close', (code: number) => {
         // Limpiar el archivo subido
         fs.unlink(filePath, (err) => {
@@ -608,13 +608,13 @@ function registerAdminRoutes(app: Express) {
     try {
       const config = req.body;
       const [existing] = await db.select().from(systemSettings).where(eq(systemSettings.key, 'backup_config'));
-      
+
       if (existing) {
         await db.update(systemSettings).set({ value: config }).where(eq(systemSettings.key, 'backup_config'));
       } else {
         await db.insert(systemSettings).values({ key: 'backup_config', value: config });
       }
-      
+
       // Notificar al servicio para reprogramar
       await backupService.reschedule();
       res.json({ message: "Configuración de respaldos actualizada correctamente" });
@@ -641,7 +641,7 @@ function registerAdminRoutes(app: Express) {
       const { filename } = req.params;
       const filepath = backupService.getBackupPath(filename);
       if (!filepath) return res.status(404).json({ message: "Archivo no encontrado" });
-      
+
       res.download(filepath);
     } catch (error) {
       console.error('Download backup error:', error);
@@ -675,9 +675,9 @@ function registerAdminRoutes(app: Express) {
         }
       }
 
-      const updateData: any = { 
-        name: name || currentUser.name, 
-        username: username || currentUser.username, 
+      const updateData: any = {
+        name: name || currentUser.name,
+        username: username || currentUser.username,
         area: area || currentUser.area,
         isActive: req.body.isActive !== undefined ? req.body.isActive : currentUser.isActive
       };
@@ -848,7 +848,7 @@ function registerRepositionRoutes(app: Express) {
       const user = (req as any).user;
 
       // Verificar que el área pueda crear reposiciones
-      const allowedAreas = ['corte', 'bordado', 'ensamble', 'plancha', 'calidad', 'envios', 'admin', 'maquilas', 'patronaje'];
+      const allowedAreas = ['corte', 'bordado', 'ensamble', 'plancha', 'calidad', 'envios', 'admin', 'maquilas', 'patronaje', 'diseño'];
       if (!allowedAreas.includes(user.area)) {
         return res.status(403).json({ message: "Su área no tiene permisos para crear reposiciones" });
       }
@@ -966,7 +966,7 @@ function registerRepositionRoutes(app: Express) {
       // Agregar nombre del operario actual (Operario)
       const repositionsWithOperator = await Promise.all(repositions.map(async (repo: any) => {
         let operatorName = null;
-        
+
         const [lastTransfer] = await db.query.repositionTransfers.findMany({
           where: and(
             eq(repositionTransfers.repositionId, repo.id),
@@ -981,8 +981,8 @@ function registerRepositionRoutes(app: Express) {
         if (lastTransfer && lastTransfer.processor) {
           operatorName = lastTransfer.processor.name;
         } else if (repo.currentArea === repo.solicitanteArea) {
-           const creator = await storage.getUser(repo.createdBy);
-           operatorName = creator ? creator.name : null;
+          const creator = await storage.getUser(repo.createdBy);
+          operatorName = creator ? creator.name : null;
         }
 
         return { ...repo, operatorName };

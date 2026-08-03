@@ -43,10 +43,8 @@ interface NotificationsPanelProps {
 const fixDate = (date: string | Date | undefined) => {
   if (!date) return new Date();
   if (typeof date === 'string') {
-    // If it doesn't end in Z and looks like an ISO string, append Z to treat as UTC
-    if (!date.endsWith('Z') && !date.includes('+') && date.includes('T')) {
-      return new Date(`${date}Z`);
-    }
+    // Return standard Date object parsing. 
+    // The server is sending local time without Z, appending Z was causing a -6 hour offset.
     return new Date(date);
   }
   return date;

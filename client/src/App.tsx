@@ -9,7 +9,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useState, useEffect, Component, ReactNode } from "react";
 import { NotificationService } from "@/lib/notifications";
 import { apiRequest } from "./lib/queryClient";
-
+import Swal from "sweetalert2";
 // Error Boundary Component
 class ErrorBoundary extends Component<
   { children: ReactNode },
@@ -111,8 +111,34 @@ function AppContent() {
 
     // Escuchar cambios por WebSocket
     const unsubscribe = onMessage((data: any) => {
-      if (isMounted && data.type === 'maintenance') {
-        console.log('Cambio de modo mantenimiento recibido:', data.enabled);
+      if (!isMounted || data.type !== 'maintenance') return;
+      
+      console.log('Cambio de modo mantenimiento recibido:', data.enabled);
+      
+      if (data.enabled && user && user.area !== 'admin') {
+        let timerInterval: any;
+        Swal.fire({
+          title: '¡Aviso Importante!',
+          html: 'Se activará el modo mantenimiento en <b></b> segundos.',
+          timer: 10000,
+          timerProgressBar: true,
+          allowOutsideClick: false,
+          icon: 'warning',
+          didOpen: () => {
+            Swal.showLoading();
+            const b = Swal.getHtmlContainer()?.querySelector('b');
+            timerInterval = setInterval(() => {
+              if (b) {
+                b.textContent = Math.ceil(Swal.getTimerLeft()! / 1000).toString();
+              }
+            }, 100);
+          },
+          willClose: () => {
+            clearInterval(timerInterval);
+            setIsMaintenance(true);
+          }
+        });
+      } else {
         setIsMaintenance(data.enabled);
       }
     });
@@ -121,7 +147,7 @@ function AppContent() {
       isMounted = false;
       unsubscribe();
     };
-  }, [onMessage]);
+  }, [onMessage, user]);
 
   useEffect(() => {
     try {
@@ -130,6 +156,7 @@ function AppContent() {
       console.error('Error initializing notification service:', error);
     }
   }, []);
+
 
   // Mientras carga cualquiera de los estados fundamentales, esperamos
   if (authLoading || isMaintenance === null) {
