@@ -316,15 +316,16 @@ export class DatabaseStorage implements IStorage {
 
     let query = db.select().from(repositions);
 
-    if (userArea === 'diseño') {
-      // Diseño puede ver todas las reposiciones aprobadas
+    if (userArea === 'diseño' || userArea === 'almacen') {
+      // Diseño y almacén pueden ver las reposiciones aprobadas en su área
       query = (query as any).where(
         and(
           eq(repositions.status, 'aprobado' as RepositionStatus),
-          ne(repositions.status, 'eliminado' as RepositionStatus)
+          ne(repositions.status, 'eliminado' as RepositionStatus),
+          eq(repositions.currentArea, userArea)
         )
       );
-      console.log('Applied diseño filter: aprobado status only');
+      console.log(`Applied ${userArea} filter: aprobado status only in their area`);
     } else if (userArea !== 'admin' && userArea !== 'envios') {
       // Otras áreas no pueden ver reposiciones eliminadas, completadas ni canceladas
       query = (query as any).where(

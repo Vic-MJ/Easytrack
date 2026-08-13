@@ -939,11 +939,11 @@ function registerRepositionRoutes(app: Express) {
 
       let repositions;
 
-      // Para diseño y almacén: solo mostrar reposiciones aprobadas
+      // Para diseño y almacén: solo mostrar reposiciones aprobadas en su área
       if (user.area === 'diseño' || user.area === 'almacen') {
         console.log(`User is from ${user.area} area, filtering approved repositions`);
-        // Diseño puede ver todas las reposiciones aprobadas
-        repositions = await storage.getRepositions(undefined, 'diseño');
+        // Diseño y almacén pueden ver las reposiciones aprobadas en su área
+        repositions = await storage.getRepositions(undefined, user.area);
       }
       else if ((user.area === 'admin' || user.area === 'envios')) {
         if (area && area !== 'all') {
