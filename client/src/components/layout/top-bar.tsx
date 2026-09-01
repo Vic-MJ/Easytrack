@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { useQuery } from "@tanstack/react-query";
+import { generateGradientCss, getTextStrokeStyle } from "@/components/admin/festivity-modal";
 
 interface TopBarProps {
     onShowNotifications: () => void;
@@ -161,7 +162,7 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
     const { data: festivitySetting } = useQuery({
         queryKey: ["/api/settings/festivity_config"],
         queryFn: async () => {
-            const res = await fetch("/api/settings/festivity_config");
+            const res = await fetch("/api/settings/festivity_config", { credentials: "include" });
             if (!res.ok) return null;
             const data = await res.json();
             if (!data.value) return null;
@@ -171,7 +172,8 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                 return null;
             }
         },
-        refetchInterval: 30000,
+        staleTime: 1000 * 60 * 5, // 5 minutos de persistencia en caché inmediata
+        refetchInterval: 15000,
     });
 
     const isFestivityActive = () => {
@@ -180,10 +182,11 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
         const targetsUsers = festivitySetting.targetUsers || [];
         const targetsAreas = festivitySetting.targetAreas || [];
         
-        if (targetsUsers.length === 0 && targetsAreas.length === 0) return false;
+        // Si no se asignó audiencia específica, se muestra para TODOS
+        if (targetsUsers.length === 0 && targetsAreas.length === 0) return true;
         
-        if (targetsUsers.includes(user.id)) return true;
-        if (user.area && targetsAreas.includes(user.area)) return true;
+        if (targetsUsers.map(Number).includes(Number(user.id))) return true;
+        if (user.area && targetsAreas.map((a: string) => a.toLowerCase()).includes(user.area.toLowerCase())) return true;
         
         return false;
     };
@@ -192,14 +195,31 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
     
     const festivityStyles = festivityActive ? {
         background: festivitySetting.useGradient 
-            ? `linear-gradient(${festivitySetting.gradientDirection || 'to right'}, ${festivitySetting.gradientStart}, ${festivitySetting.gradientEnd})`
+            ? generateGradientCss(
+                festivitySetting.gradientType || 'linear',
+                festivitySetting.gradientDirection || 'to right',
+                festivitySetting.gradientColors && festivitySetting.gradientColors.length > 0
+                    ? festivitySetting.gradientColors
+                    : [festivitySetting.gradientStart || '#ff416c', festivitySetting.gradientEnd || '#ff4b2b']
+              )
             : festivitySetting.backgroundColor,
         color: festivitySetting.textColor,
         fontFamily: festivitySetting.fontFamily !== 'Inter' ? `"${festivitySetting.fontFamily}", sans-serif` : undefined,
         backgroundImage: festivitySetting.backgroundImage ? `url(${festivitySetting.backgroundImage})` : undefined,
-        backgroundSize: 'cover',
-        backgroundPosition: 'center',
+        backgroundSize: festivitySetting.backgroundSize === 'custom' 
+            ? `${festivitySetting.backgroundScale || 100}%` 
+            : (festivitySetting.backgroundSize || 'cover'),
+        backgroundPosition: `${festivitySetting.backgroundPositionX ?? 50}% ${festivitySetting.backgroundPositionY ?? 50}%`,
+        backgroundRepeat: 'no-repeat',
     } : {};
+
+    const textStrokeStyle = festivityActive 
+        ? getTextStrokeStyle(
+            festivitySetting.useTextStroke, 
+            festivitySetting.textStrokeColor, 
+            festivitySetting.textStrokeWidth
+          ) 
+        : {};
 
     const baseHeaderClass = "relative h-16 border-b border-border/70 backdrop-blur-md sticky top-0 z-40 shadow-md dark:shadow-none transition-all duration-500 overflow-hidden group w-full flex items-center";
     const headerClass = festivityActive 
@@ -258,6 +278,14 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
     return (
         <>
             <div className={headerClass} style={festivityStyles}>
+                {/* Capa de Contraste / Sombreado de Fondo si está configurado */}
+                {festivityActive && (festivitySetting.overlayOpacity || 0) > 0 && (
+                    <div 
+                        className="absolute inset-0 z-10 pointer-events-none transition-all duration-300"
+                        style={{ backgroundColor: `rgba(0, 0, 0, ${(festivitySetting.overlayOpacity || 0) / 100})` }}
+                    />
+                )}
+
                 {renderFloatingEmojis()}
                 {/* Decoración Temática Extendida - Solo si no hay festividad activa */}
                 {!festivityActive && (
@@ -288,9 +316,9 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                     </div>
                 )}
 
-                <div className="relative z-30 flex h-full items-center justify-between px-8 w-full">
+                <div className="relative z-30 flex h-full items-center justify-between px-6 md:px-8 w-full">
 
-                    {/* Left Section: User info / Default greeting */}
+                    {/* Left Section: User info / Default greeting / Area Badge */}
                     <div className="flex flex-col leading-snug flex-1 shrink-0">
                         {(!festivityActive || !festivitySetting.message) && (
                             <h2 className="text-xl lg:text-2xl font-extrabold tracking-tight text-foreground flex items-center whitespace-nowrap">
@@ -299,12 +327,16 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                             </h2>
                         )}
                         {user?.area && (
-                            <div className="flex items-center gap-2 mt-1">
-                                <span className="text-sm font-medium text-muted-foreground" style={festivityActive ? { color: festivitySetting.textColor, opacity: 0.8 } : {}}>
+                            <div className={
+                                festivityActive
+                                    ? "flex items-center gap-2 bg-black/45 dark:bg-black/60 backdrop-blur-md border border-white/25 text-white px-3 py-1 rounded-full w-fit shadow-md transition-all"
+                                    : "flex items-center gap-2 mt-1"
+                            }>
+                                <span className={festivityActive ? "text-xs font-semibold text-white drop-shadow-sm" : "text-sm font-medium text-muted-foreground"}>
                                     Área de trabajo:
                                 </span>
                                 <Badge
-                                    className={`text-xs px-2 py-0.5 font-semibold uppercase ${getAreaColor(user.area)}`}
+                                    className={`text-xs px-2 py-0.5 font-semibold uppercase shadow-sm ${getAreaColor(user.area)}`}
                                 >
                                     {getAreaDisplayName(user.area)}
                                 </Badge>
@@ -315,33 +347,43 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                     {/* Center Section: Festivity Message & Note */}
                     {festivityActive && festivitySetting.message && (
                         <div className={`flex-1 flex items-center px-4 z-40 pointer-events-auto ${getMessageAlignmentClass()}`}>
-                            <h2 
-                                className="text-2xl lg:text-3xl font-extrabold tracking-tight flex items-center drop-shadow-md gap-4 whitespace-nowrap" 
-                                style={{ color: festivitySetting.useMulticolorText ? undefined : festivitySetting.textColor }}
-                            >
-                                <div className="flex">
-                                    {festivitySetting.useMulticolorText ? (
-                                        festivitySetting.message.split('').map((char: string, i: number) => (
-                                            <span key={i} style={{ color: char.trim() ? (festivitySetting.customLetterColors?.[i] || ['#FF3B30', '#FF9500', '#FFCC00', '#4CD964', '#5AC8FA', '#007AFF', '#5856D6', '#FF2D55'][i % 8]) : undefined }}>
-                                                {char === ' ' ? '\u00A0' : char}
-                                            </span>
-                                        ))
-                                    ) : (
-                                        festivitySetting.message
+                            <div className={festivitySetting?.useMessagePill ? "bg-black/40 dark:bg-black/55 backdrop-blur-md border border-white/25 px-4 py-1.5 rounded-2xl shadow-lg flex items-center gap-4" : "flex items-center gap-4"}>
+                                <h2 
+                                    className="text-2xl lg:text-3xl font-extrabold tracking-tight flex items-center drop-shadow-md gap-4 whitespace-nowrap" 
+                                    style={{ 
+                                        color: festivitySetting.useMulticolorText ? undefined : festivitySetting.textColor,
+                                        ...textStrokeStyle
+                                    }}
+                                >
+                                    <div className="flex">
+                                        {festivitySetting.useMulticolorText ? (
+                                            festivitySetting.message.split('').map((char: string, i: number) => (
+                                                <span 
+                                                    key={i} 
+                                                    style={{ 
+                                                        color: char.trim() ? (festivitySetting.customLetterColors?.[i] || ['#FF3B30', '#FF9500', '#FFCC00', '#4CD964', '#5AC8FA', '#007AFF', '#5856D6', '#FF2D55'][i % 8]) : undefined,
+                                                        ...textStrokeStyle
+                                                    }}
+                                                >
+                                                    {char === ' ' ? '\u00A0' : char}
+                                                </span>
+                                            ))
+                                        ) : (
+                                            festivitySetting.message
+                                        )}
+                                    </div>
+                                    {festivitySetting.noteEnabled && (
+                                        <Button 
+                                            variant="secondary" 
+                                            size="sm" 
+                                            className="h-8 rounded-full font-sans text-xs bg-white/25 hover:bg-white/40 border border-white/40 text-white backdrop-blur-md shadow-lg transition-all cursor-pointer relative z-50 pointer-events-auto font-bold"
+                                            onClick={() => setShowNoteDialog(true)}
+                                        >
+                                            {festivitySetting.noteButtonText || "Ver Sorpresa"}
+                                        </Button>
                                     )}
-                                </div>
-                                {festivitySetting.noteEnabled && (
-                                    <Button 
-                                        variant="secondary" 
-                                        size="sm" 
-                                        className="h-8 rounded-full font-sans text-xs bg-white/20 hover:bg-white/40 border border-white/30 backdrop-blur-sm shadow-lg transition-all cursor-pointer relative z-50 pointer-events-auto"
-                                        onClick={() => setShowNoteDialog(true)}
-                                        style={{ color: festivitySetting.textColor }}
-                                    >
-                                        {festivitySetting.noteButtonText || "Ver Sorpresa"}
-                                    </Button>
-                                )}
-                            </h2>
+                                </h2>
+                            </div>
                         </div>
                     )}
 
@@ -356,60 +398,62 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
 
                     {/* Right Section: Notifications and User Menu */}
                     <div className="flex items-center gap-3 h-full flex-1 justify-end shrink-0 pointer-events-auto z-40">
+                        <div className={
+                            festivityActive
+                                ? "flex items-center gap-1.5 bg-black/45 dark:bg-black/60 backdrop-blur-md border border-white/25 p-1 pl-2.5 rounded-full shadow-md text-white transition-all"
+                                : "flex items-center gap-3"
+                        }>
+                            {timeLeft.days > 0 && (!festivityActive) && (
+                                <div className="hidden lg:flex items-center gap-2 text-sm text-primary/70 font-medium bg-muted/50 rounded-lg px-3 py-1">
+                                    <Clock className="w-4 h-4" />
+                                    <span className="font-mono">{timeLeft.days}d {timeLeft.hours}h {timeLeft.minutes}m</span>
+                                </div>
+                            )}
 
-                        {timeLeft.days > 0 && (!festivityActive) && (
-                            <div className="hidden lg:flex items-center gap-2 text-sm text-primary/70 font-medium bg-muted/50 rounded-lg px-3 py-1">
-                                <Clock className="w-4 h-4" />
-                                <span className="font-mono">{timeLeft.days}d {timeLeft.hours}h {timeLeft.minutes}m</span>
-                            </div>
-                        )}
+                            <div className={`flex items-center gap-1 ${festivityActive ? 'border-r border-white/30 pr-1.5' : 'border-r pr-2 border-border/70'}`}>
+                                <ThemeToggle />
 
-                        <div className="flex items-center gap-1 border-r pr-2 border-border/70">
-                            <ThemeToggle />
-
-                            <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={onShowNotifications}
-                                className={`relative h-10 w-10 rounded-full transition-colors ${festivityActive ? 'hover:bg-white/20 text-current' : 'hover:bg-muted'}`}
-                                title="Notificaciones Pendientes"
-                                style={festivityActive ? { color: festivitySetting.textColor } : {}}
-                            >
-                                <Bell className={`h-5 w-5 ${festivityActive ? '' : 'text-foreground/80'}`} />
-                                {totalNotifications > 0 && (
-                                    <Badge
-                                        variant="destructive"
-                                        className="absolute -top-1 -right-1 h-5 w-5 rounded-full p-0 text-xs flex items-center justify-center min-w-5 border-2 border-background shadow-lg animate-pulse"
-                                    >
-                                        {totalNotifications > 99 ? '99+' : totalNotifications}
-                                    </Badge>
-                                )}
-                            </Button>
-                        </div>
-
-                        <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
                                 <Button
                                     variant="ghost"
-                                    className={`flex items-center gap-2 h-10 pl-1 pr-3 rounded-full transition-colors ${festivityActive ? 'hover:bg-white/20 text-current' : 'hover:bg-muted'}`}
-                                    title={`Menú de Usuario: ${user?.name || "Usuario"}`}
-                                    style={festivityActive ? { color: festivitySetting.textColor } : {}}
+                                    size="icon"
+                                    onClick={onShowNotifications}
+                                    className={`relative h-8 w-8 rounded-full transition-colors ${festivityActive ? 'hover:bg-white/20 text-white' : 'hover:bg-muted text-foreground/80'}`}
+                                    title="Notificaciones Pendientes"
                                 >
-                                    <Avatar className="h-9 w-9 border-2 border-transparent group-hover:border-primary transition-colors">
-                                        <AvatarImage src="" alt={user?.name || ""} />
-                                        <AvatarFallback
-                                            className={`font-bold text-base ${getAreaColor(user?.area || '')}`}
+                                    <Bell className="h-4 w-4 drop-shadow-sm" />
+                                    {totalNotifications > 0 && (
+                                        <Badge
+                                            variant="destructive"
+                                            className="absolute -top-1 -right-1 h-4 w-4 rounded-full p-0 text-[10px] flex items-center justify-center min-w-4 border border-white shadow-lg animate-pulse font-bold"
                                         >
-                                            {getUserInitials(user?.name || "")}
-                                        </AvatarFallback>
-                                    </Avatar>
-                                    <span className={`hidden sm:inline text-sm font-semibold ${festivityActive ? '' : 'text-foreground/90'}`}>
-                                        {user?.name.split(' ')[0]}
-                                    </span>
-                                    <ChevronDown className={`h-4 w-4 transition-transform duration-200 ${festivityActive ? 'opacity-80' : 'text-muted-foreground'}`} />
+                                            {totalNotifications > 99 ? '99+' : totalNotifications}
+                                        </Badge>
+                                    )}
                                 </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent className="w-64" align="end" forceMount>
+                            </div>
+
+                            <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                    <Button
+                                        variant="ghost"
+                                        className={`flex items-center gap-2 h-8 pl-1 pr-2.5 rounded-full transition-colors ${festivityActive ? 'hover:bg-white/20 text-white' : 'hover:bg-muted'}`}
+                                        title={`Menú de Usuario: ${user?.name || "Usuario"}`}
+                                    >
+                                        <Avatar className="h-7 w-7 border border-white/40 shadow-sm">
+                                            <AvatarImage src="" alt={user?.name || ""} />
+                                            <AvatarFallback
+                                                className={`font-bold text-xs ${getAreaColor(user?.area || '')}`}
+                                            >
+                                                {getUserInitials(user?.name || "")}
+                                            </AvatarFallback>
+                                        </Avatar>
+                                        <span className={`hidden sm:inline text-xs font-bold ${festivityActive ? 'text-white drop-shadow-sm' : 'text-foreground/90'}`}>
+                                            {user?.name.split(' ')[0]}
+                                        </span>
+                                        <ChevronDown className={`h-3.5 w-3.5 ${festivityActive ? 'text-white/80' : 'text-muted-foreground'}`} />
+                                    </Button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent className="w-64" align="end" forceMount>
                                 <DropdownMenuLabel className="font-normal">
                                     <div className="flex items-center gap-3">
                                         <Avatar className="h-10 w-10">
@@ -460,6 +504,7 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                     </div>
                 </div>
             </div>
+        </div>
 
             <Dialog open={showProfile} onOpenChange={setShowProfile}>
                 <DialogContent className="sm:max-w-[420px] p-0 overflow-hidden border-none shadow-2xl bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl ring-1 ring-white/20">
@@ -561,7 +606,13 @@ export function TopBar({ onShowNotifications }: TopBarProps) {
                         className="absolute inset-0 z-0 transition-all duration-500"
                         style={{
                             background: festivitySetting?.noteUseGradient 
-                                ? `linear-gradient(${festivitySetting.noteGradientDirection || 'to right'}, ${festivitySetting.noteGradientStart}, ${festivitySetting.noteGradientEnd})`
+                                ? generateGradientCss(
+                                    festivitySetting.noteGradientType || 'linear',
+                                    festivitySetting.noteGradientDirection || 'to right',
+                                    festivitySetting.noteGradientColors && festivitySetting.noteGradientColors.length > 0
+                                        ? festivitySetting.noteGradientColors
+                                        : [festivitySetting.noteGradientStart || '#ff416c', festivitySetting.noteGradientEnd || '#ff4b2b']
+                                  )
                                 : (festivitySetting?.noteBackgroundColor || '#ffffff'),
                             opacity: (festivitySetting?.noteOpacity !== undefined ? festivitySetting.noteOpacity : 100) / 100,
                         }}

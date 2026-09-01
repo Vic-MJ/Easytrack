@@ -2418,7 +2418,7 @@ function registerSettingsRoutes(app: Express) {
   router.get("/:key", async (req, res) => {
     try {
       const key = req.params.key;
-      const publicKeys = ['maintenance_mode', 'maintenance_duration', 'maintenance_start_time'];
+      const publicKeys = ['maintenance_mode', 'maintenance_duration', 'maintenance_start_time', 'festivity_config'];
 
       if (!req.isAuthenticated() && !publicKeys.includes(key)) {
         return res.status(401).json({ message: "Autenticación requerida" });
@@ -2454,10 +2454,10 @@ function registerSettingsRoutes(app: Express) {
 
       await storage.setSystemSetting(key, String(value), user.id);
 
-      // Broadcast maintenance mode change via WebSocket
-      if (key === 'maintenance_mode') {
-        const wss = (global as any).wss;
-        if (wss) {
+      // Broadcast changes via WebSocket
+      const wss = (global as any).wss;
+      if (wss) {
+        if (key === 'maintenance_mode') {
           wss.clients.forEach((client: any) => {
             if (client.readyState === 1) { // WebSocket.OPEN
               client.send(JSON.stringify({
@@ -2467,6 +2467,15 @@ function registerSettingsRoutes(app: Express) {
             }
           });
           console.log(`Mantenimiento ${value === 'true' || value === true ? 'activado' : 'desactivado'} y notificado por WebSocket`);
+        } else if (key === 'festivity_config') {
+          wss.clients.forEach((client: any) => {
+            if (client.readyState === 1) { // WebSocket.OPEN
+              client.send(JSON.stringify({
+                type: 'festivity_update'
+              }));
+            }
+          });
+          console.log('Configuración festiva actualizada y notificada por WebSocket a todos los clientes');
         }
       }
 

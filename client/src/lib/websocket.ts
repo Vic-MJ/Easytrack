@@ -105,6 +105,13 @@ export function useWebSocket() {
     setIsConnected(true);
 
     const messageListener = (message: any) => {
+      if (message.type === 'festivity_update') {
+        console.log('Actualización festiva recibida por WebSocket');
+        queryClient.invalidateQueries({ queryKey: ['/api/settings/festivity_config'] });
+        queryClient.refetchQueries({ queryKey: ['/api/settings/festivity_config'] });
+        return;
+      }
+
       if (message.type !== 'notification') return;
 
       const notification = message.data;
